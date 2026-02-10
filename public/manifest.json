@@ -6,10 +6,12 @@
   "permissions": [
     "storage",
     "tabs",
-    "scripting"
+    "scripting",
+    "notifications",
+    "cookies"
   ],
   "host_permissions": [
-    "https://www.twitch.tv/*",
+    "https://*.twitch.tv/*",
     "https://twitch.tv/*"
   ],
   "action": {
@@ -27,7 +29,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.twitch.tv/*", "https://twitch.tv/*"],
+      "matches": ["https://*.twitch.tv/*", "https://twitch.tv/*"],
+      "js": ["integrity-interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://*.twitch.tv/*", "https://twitch.tv/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
