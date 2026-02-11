@@ -7,6 +7,26 @@ export default defineConfig({
   plugins: [
     react(),
     {
+      // Wrap content scripts in IIFE with duplicate-injection guard.
+      // Chrome may re-inject content scripts during SPA navigation or
+      // extension reloads; bare top-level `const` would throw
+      // "Identifier already declared".  The guard `return`s early from
+      // the IIFE so no listeners/observers are registered twice.
+      name: 'wrap-content-scripts-iife',
+      generateBundle(_, bundle) {
+        const guards: Record<string, string> = {
+          'content.js': '__drophunter_content__',
+          'integrity-interceptor.js': '__drophunter_interceptor__',
+        };
+        for (const [fileName, chunk] of Object.entries(bundle)) {
+          const guard = guards[fileName];
+          if (guard && chunk.type === 'chunk') {
+            chunk.code = `(function(){if(window["${guard}"])return;window["${guard}"]=true;${chunk.code}})();\n`;
+          }
+        }
+      },
+    },
+    {
       name: 'copy-manifest-and-icons',
       closeBundle() {
         // Copia manifest.json
