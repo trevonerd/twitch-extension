@@ -1,4 +1,5 @@
-import { DropsSnapshot, DropStatus, TwitchDrop, TwitchGame, TwitchStreamer } from '../../types';
+import { toSlug } from '../../shared/utils';
+import { DropStatus, DropsSnapshot, TwitchDrop, TwitchGame, TwitchStreamer } from '../../types';
 import { TwitchGqlTransport } from './gql';
 import { TwitchSession } from './types';
 
@@ -58,13 +59,6 @@ const CLAIM_DROP_REWARD_QUERY = {
 
 function normalizeText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-function toSlug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '');
 }
 
 function toNumber(value: unknown): number | null {
@@ -127,7 +121,16 @@ function getFirstImageUrl(value: unknown, depth = 0): string {
   }
 
   const record = value as Record<string, unknown>;
-  const priorityKeys = ['imageURL', 'imageUrl', 'boxArtURL', 'boxArtUrl', 'thumbnailURL', 'thumbnailUrl', 'url', 'src'];
+  const priorityKeys = [
+    'imageURL',
+    'imageUrl',
+    'boxArtURL',
+    'boxArtUrl',
+    'thumbnailURL',
+    'thumbnailUrl',
+    'url',
+    'src',
+  ];
   for (const key of priorityKeys) {
     const candidate = getFirstImageUrl(record[key], depth + 1);
     if (candidate) {
@@ -144,7 +147,10 @@ function getFirstImageUrl(value: unknown, depth = 0): string {
   return '';
 }
 
-function computeExpiry(endsAt: string | null): { expiresInMs: number | null; expiryStatus: TwitchGame['expiryStatus'] } {
+function computeExpiry(endsAt: string | null): {
+  expiresInMs: number | null;
+  expiryStatus: TwitchGame['expiryStatus'];
+} {
   if (!endsAt) {
     return { expiresInMs: null, expiryStatus: 'unknown' };
   }
@@ -210,7 +216,9 @@ function buildInventoryDropMaps(inventoryRaw: unknown): InventoryDropMaps {
       return;
     }
 
-    const timeBasedDrops = Array.isArray(campaign.timeBasedDrops) ? (campaign.timeBasedDrops as Array<Record<string, unknown>>) : [];
+    const timeBasedDrops = Array.isArray(campaign.timeBasedDrops)
+      ? (campaign.timeBasedDrops as Array<Record<string, unknown>>)
+      : [];
     timeBasedDrops.forEach((drop) => {
       if (!drop || typeof drop !== 'object') {
         return;
@@ -273,7 +281,10 @@ function extractBenefitIds(drop: Record<string, unknown>): string[] {
 }
 
 /** Lookup of claimed rewards from inventory gameEventDrops, keyed by normalized game name */
-interface ClaimedRewardEntry { nameCounts: Map<string, number>; idCounts: Map<string, number>; }
+interface ClaimedRewardEntry {
+  nameCounts: Map<string, number>;
+  idCounts: Map<string, number>;
+}
 type ClaimedRewardLookup = Map<string, ClaimedRewardEntry>;
 
 function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
@@ -307,13 +318,21 @@ function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
     const entry = lookup.get(gameName)!;
     if (rewardName) entry.nameCounts.set(rewardName, (entry.nameCounts.get(rewardName) ?? 0) + 1);
     if (benefitId) entry.idCounts.set(benefitId, (entry.idCounts.get(benefitId) ?? 0) + 1);
-    console.info(`[buildClaimedRewardLookup] game="${gameName}" claimedName="${rewardName}" benefitId="${benefitId}"`);
+    console.info(
+      `[buildClaimedRewardLookup] game="${gameName}" claimedName="${rewardName}" benefitId="${benefitId}"`,
+    );
   });
 
   lookup.forEach((entry, gameName) => {
-    const nameEntries = Array.from(entry.nameCounts.entries()).map(([n, c]) => `${n}(x${c})`).join(', ');
-    const idEntries = Array.from(entry.idCounts.entries()).map(([id, c]) => `${id}(x${c})`).join(', ');
-    console.info(`[buildClaimedRewardLookup] SUMMARY game="${gameName}" claimedNames=[${nameEntries}] claimedIdCounts=[${idEntries}]`);
+    const nameEntries = Array.from(entry.nameCounts.entries())
+      .map(([n, c]) => `${n}(x${c})`)
+      .join(', ');
+    const idEntries = Array.from(entry.idCounts.entries())
+      .map(([id, c]) => `${id}(x${c})`)
+      .join(', ');
+    console.info(
+      `[buildClaimedRewardLookup] SUMMARY game="${gameName}" claimedNames=[${nameEntries}] claimedIdCounts=[${idEntries}]`,
+    );
   });
 
   return lookup;
@@ -381,14 +400,17 @@ function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | 
       allowedChannels = channelsRaw
         .map((ch) => {
           if (!ch || typeof ch !== 'object') return '';
-          return (typeof (ch as Record<string, unknown>).name === 'string'
-            ? ((ch as Record<string, unknown>).name as string).trim().toLowerCase() : '');
+          return typeof (ch as Record<string, unknown>).name === 'string'
+            ? ((ch as Record<string, unknown>).name as string).trim().toLowerCase()
+            : '';
         })
         .filter((name) => name.length > 0);
       if (allowedChannels.length === 0) allowedChannels = null;
     }
   }
-  console.info(`[parseGameFromCampaign] game="${displayName}" campaign="${campaignId}" allowedChannels=${allowedChannels ? JSON.stringify(allowedChannels) : 'null (any channel)'}`);
+  console.info(
+    `[parseGameFromCampaign] game="${displayName}" campaign="${campaignId}" allowedChannels=${allowedChannels ? JSON.stringify(allowedChannels) : 'null (any channel)'}`,
+  );
 
   return {
     id: campaignId ? `campaign-${campaignId}` : `game-${toSlug(displayName)}`,
@@ -405,10 +427,18 @@ function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | 
   };
 }
 
-function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame, inventoryMaps: InventoryDropMaps, claimedRewards: ClaimedRewardLookup, globalClaimedIdCounts: Map<string, number>): TwitchDrop[] {
+function parseCampaignDrops(
+  campaign: Record<string, unknown>,
+  game: TwitchGame,
+  inventoryMaps: InventoryDropMaps,
+  claimedRewards: ClaimedRewardLookup,
+  globalClaimedIdCounts: Map<string, number>,
+): TwitchDrop[] {
   const campaignId = normalizeText(campaign.id) || game.campaignId || '';
   const campaignEndsAt = toIsoDate(campaign.endAt);
-  const timeBasedDrops = Array.isArray(campaign.timeBasedDrops) ? (campaign.timeBasedDrops as Array<Record<string, unknown>>) : [];
+  const timeBasedDrops = Array.isArray(campaign.timeBasedDrops)
+    ? (campaign.timeBasedDrops as Array<Record<string, unknown>>)
+    : [];
   const gameClaimedRewards = claimedRewards.get(game.name.toLowerCase());
 
   const parsedDrops = timeBasedDrops.map((drop, index) => {
@@ -417,9 +447,14 @@ function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame,
     const inventoryState =
       inventoryMaps.byCampaignDrop.get(`${campaignId}::${parsedDropId}`) ??
       (parsedDropId ? inventoryMaps.byDropId.get(parsedDropId) : undefined);
-    const claimId = inventoryState?.claimId || normalizeText(self.dropInstanceID) || normalizeText(self.dropInstanceId);
-    const requiredMinutes = inventoryState?.requiredMinutes ?? toNumber(drop.requiredMinutesWatched ?? drop.requiredMinutes);
-    const currentMinutes = inventoryState?.currentMinutes ?? (toNumber(self.currentMinutesWatched ?? drop.currentMinutesWatched) ?? 0);
+    const claimId =
+      inventoryState?.claimId || normalizeText(self.dropInstanceID) || normalizeText(self.dropInstanceId);
+    const requiredMinutes =
+      inventoryState?.requiredMinutes ?? toNumber(drop.requiredMinutesWatched ?? drop.requiredMinutes);
+    const currentMinutes =
+      inventoryState?.currentMinutes ??
+      toNumber(self.currentMinutesWatched ?? drop.currentMinutesWatched) ??
+      0;
     // Check if any of this drop's benefit rewards appear in the user's claimed gameEventDrops
     const benefitNames = extractBenefitNames(drop);
     const benefitIds = extractBenefitIds(drop);
@@ -462,9 +497,13 @@ function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame,
     const claimedFromGameEvents = idMatch || nameMatch || globalIdMatch;
     const claimedFromInventory = inventoryState?.claimed ?? Boolean(self.isClaimed ?? drop.isClaimed);
     const claimed = claimedFromGameEvents || claimedFromInventory;
-    console.info(`[parseCampaignDrops] drop="${normalizeText(drop.name)}" game="${game.name}" benefitIds=[${benefitIds.join(', ')}] benefitNames=[${benefitNames.join(', ')}] idMatch=${idMatch} nameMatch=${nameMatch} globalIdMatch=${globalIdMatch} claimedFromGameEvents=${claimedFromGameEvents} claimedFromInventory=${claimedFromInventory} claimed=${claimed} hasGameClaimedRewards=${gameClaimedRewards != null}`);
+    console.info(
+      `[parseCampaignDrops] drop="${normalizeText(drop.name)}" game="${game.name}" benefitIds=[${benefitIds.join(', ')}] benefitNames=[${benefitNames.join(', ')}] idMatch=${idMatch} nameMatch=${nameMatch} globalIdMatch=${globalIdMatch} claimedFromGameEvents=${claimedFromGameEvents} claimedFromInventory=${claimedFromInventory} claimed=${claimed} hasGameClaimedRewards=${gameClaimedRewards != null}`,
+    );
     const claimableFromApi = inventoryState?.claimable ?? Boolean(self.isClaimable ?? self.canClaim);
-    const claimableFromProgress = Boolean(!claimed && requiredMinutes !== null && requiredMinutes > 0 && currentMinutes >= requiredMinutes);
+    const claimableFromProgress = Boolean(
+      !claimed && requiredMinutes !== null && requiredMinutes > 0 && currentMinutes >= requiredMinutes,
+    );
     const hasDropInstance = Boolean(claimId) && !claimed;
     const claimable = claimableFromApi || claimableFromProgress || hasDropInstance;
     const progress =
@@ -584,7 +623,9 @@ export class TwitchApiClient {
 
   async fetchDropsSnapshot(): Promise<DropsSnapshot> {
     const [dashboardData, inventoryData] = await Promise.all([
-      this.transport.postAuthorized<{ currentUser?: { dropCampaigns?: Array<Record<string, unknown>> } }>(VIEWER_DROPS_DASHBOARD_QUERY),
+      this.transport.postAuthorized<{ currentUser?: { dropCampaigns?: Array<Record<string, unknown>> } }>(
+        VIEWER_DROPS_DASHBOARD_QUERY,
+      ),
       this.transport
         .postAuthorized<{ currentUser?: { inventory?: Record<string, unknown> } }>(INVENTORY_QUERY)
         .catch(() => ({ currentUser: { inventory: null } })),
@@ -598,15 +639,25 @@ export class TwitchApiClient {
       const keys = Object.keys(inv);
       const gameEventDropsRaw = inv.gameEventDrops;
       const gameEventDropsCount = Array.isArray(gameEventDropsRaw) ? gameEventDropsRaw.length : 'NOT_ARRAY';
-      const campaignsInProgress = Array.isArray(inv.dropCampaignsInProgress) ? inv.dropCampaignsInProgress as Array<Record<string, unknown>> : [];
+      const campaignsInProgress = Array.isArray(inv.dropCampaignsInProgress)
+        ? (inv.dropCampaignsInProgress as Array<Record<string, unknown>>)
+        : [];
       console.info(`[TwitchApiClient] Raw inventory keys: [${keys.join(', ')}]`);
-      console.info(`[TwitchApiClient] gameEventDrops: count=${gameEventDropsCount}, type=${typeof gameEventDropsRaw}, isNull=${gameEventDropsRaw === null}`);
+      console.info(
+        `[TwitchApiClient] gameEventDrops: count=${gameEventDropsCount}, type=${typeof gameEventDropsRaw}, isNull=${gameEventDropsRaw === null}`,
+      );
       // Log each in-progress campaign with claimed drops
       campaignsInProgress.forEach((c) => {
         if (!c || typeof c !== 'object') return;
         const cId = normalizeText(c.id);
-        const cGame = c.game && typeof c.game === 'object' ? normalizeText((c.game as Record<string, unknown>).displayName) || normalizeText((c.game as Record<string, unknown>).name) : '?';
-        const timeBasedDrops = Array.isArray(c.timeBasedDrops) ? c.timeBasedDrops as Array<Record<string, unknown>> : [];
+        const cGame =
+          c.game && typeof c.game === 'object'
+            ? normalizeText((c.game as Record<string, unknown>).displayName) ||
+              normalizeText((c.game as Record<string, unknown>).name)
+            : '?';
+        const timeBasedDrops = Array.isArray(c.timeBasedDrops)
+          ? (c.timeBasedDrops as Array<Record<string, unknown>>)
+          : [];
         timeBasedDrops.forEach((d) => {
           if (!d || typeof d !== 'object') return;
           const dId = normalizeText(d.id);
@@ -614,30 +665,33 @@ export class TwitchApiClient {
           const isClaimed = Boolean(self.isClaimed ?? d.isClaimed);
           const currentMin = toNumber(self.currentMinutesWatched ?? d.currentMinutesWatched) ?? 0;
           const reqMin = toNumber(d.requiredMinutesWatched ?? d.requiredMinutes);
-          console.info(`[TwitchApiClient] InProgress campaign="${cId}" game="${cGame}" drop="${dId}" claimed=${isClaimed} progress=${currentMin}/${reqMin}`);
+          console.info(
+            `[TwitchApiClient] InProgress campaign="${cId}" game="${cGame}" drop="${dId}" claimed=${isClaimed} progress=${currentMin}/${reqMin}`,
+          );
         });
       });
     } else {
-      console.warn(`[TwitchApiClient] inventoryRaw is ${inventoryRaw === null ? 'null' : typeof inventoryRaw}`);
+      console.warn(
+        `[TwitchApiClient] inventoryRaw is ${inventoryRaw === null ? 'null' : typeof inventoryRaw}`,
+      );
     }
     const inventoryMaps = buildInventoryDropMaps(inventoryRaw);
     const claimedRewards = buildClaimedRewardLookup(inventoryRaw);
     const globalClaimedIdCounts = buildGlobalClaimedIdCounts(inventoryRaw);
-    console.info(`[TwitchApiClient] Inventory maps: ${inventoryMaps.byCampaignDrop.size} campaign::drop entries, ${inventoryMaps.byDropId.size} drop entries, ${claimedRewards.size} games with claimed rewards, ${globalClaimedIdCounts.size} global claimed IDs`);
-
-    // Filter to usable (non-expired) campaigns — show all, not just connected ones
-    const usableCampaigns = campaigns.filter(
-      (c) => c && typeof c === 'object' && isCampaignUsable(c),
+    console.info(
+      `[TwitchApiClient] Inventory maps: ${inventoryMaps.byCampaignDrop.size} campaign::drop entries, ${inventoryMaps.byDropId.size} drop entries, ${claimedRewards.size} games with claimed rewards, ${globalClaimedIdCounts.size} global claimed IDs`,
     );
 
-    // Fetch detailed campaign data (with timeBasedDrops) for all usable campaigns
-    const campaignIds = usableCampaigns
-      .map((c) => normalizeText(c.id))
-      .filter((id) => id.length > 0);
+    // Filter to usable (non-expired) campaigns — show all, not just connected ones
+    const usableCampaigns = campaigns.filter((c) => c && typeof c === 'object' && isCampaignUsable(c));
 
-    const detailsMap = campaignIds.length > 0
-      ? await this.fetchCampaignDetailsBatch(campaignIds)
-      : new Map<string, Record<string, unknown>>();
+    // Fetch detailed campaign data (with timeBasedDrops) for all usable campaigns
+    const campaignIds = usableCampaigns.map((c) => normalizeText(c.id)).filter((id) => id.length > 0);
+
+    const detailsMap =
+      campaignIds.length > 0
+        ? await this.fetchCampaignDetailsBatch(campaignIds)
+        : new Map<string, Record<string, unknown>>();
 
     const games: TwitchGame[] = [];
     const drops: TwitchDrop[] = [];
@@ -648,9 +702,7 @@ export class TwitchApiClient {
       // so parseGameFromCampaign can access game.slug from DropCampaignDetails
       const campaignId = normalizeText(campaign.id);
       const details = campaignId ? detailsMap.get(campaignId) : undefined;
-      const mergedCampaign = details
-        ? { ...campaign, ...details }
-        : campaign;
+      const mergedCampaign = details ? { ...campaign, ...details } : campaign;
 
       const game = parseGameFromCampaign(mergedCampaign);
       if (!game) {
@@ -662,7 +714,13 @@ export class TwitchApiClient {
         campaignChannelsMap[campaignId] = game.allowedChannels ?? null;
       }
 
-      const campaignDrops = parseCampaignDrops(mergedCampaign, game, inventoryMaps, claimedRewards, globalClaimedIdCounts);
+      const campaignDrops = parseCampaignDrops(
+        mergedCampaign,
+        game,
+        inventoryMaps,
+        claimedRewards,
+        globalClaimedIdCounts,
+      );
       games.push({
         ...game,
         dropCount: campaignDrops.length,
@@ -775,7 +833,10 @@ export class TwitchApiClient {
       };
 
       const existing = byChannel.get(candidate.name);
-      if (!existing || (candidate.viewerCount ?? Number.MAX_SAFE_INTEGER) < (existing.viewerCount ?? Number.MAX_SAFE_INTEGER)) {
+      if (
+        !existing ||
+        (candidate.viewerCount ?? Number.MAX_SAFE_INTEGER) < (existing.viewerCount ?? Number.MAX_SAFE_INTEGER)
+      ) {
         byChannel.set(candidate.name, candidate);
       }
     });
@@ -791,7 +852,9 @@ export class TwitchApiClient {
 
     // First try with drops tag filter
     const taggedPayload = this.buildDirectoryPayload(game, slug, [DROPS_TAG_ID]);
-    const taggedData = await this.transport.post<{ game?: { streams?: { edges?: Array<{ node?: Record<string, unknown> }> } } }>(taggedPayload);
+    const taggedData = await this.transport.post<{
+      game?: { streams?: { edges?: Array<{ node?: Record<string, unknown> }> } };
+    }>(taggedPayload);
     const taggedEdges = taggedData.game?.streams?.edges ?? [];
     const taggedStreamers = this.parseDirectoryEdges(taggedEdges);
 

@@ -1,26 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AppState } from '../types';
 import { pickNearestDrop } from '../shared/drop-order.js';
-
-const createInitialState = (): AppState => ({
-  selectedGame: null,
-  isRunning: false,
-  isPaused: false,
-  activeStreamer: null,
-  currentDrop: null,
-  completedDrops: [],
-  pendingDrops: [],
-  allDrops: [],
-  availableGames: [],
-  queue: [],
-  workspaceWindowId: null,
-  monitorWindowId: null,
-  tabId: null,
-  directoryTabId: null,
-  dropsTabId: null,
-  inventoryTabId: null,
-  completionNotified: false,
-});
+import { createInitialState } from '../shared/utils';
+import { AppState } from '../types';
 
 function etaLabel(value?: number | null): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -80,7 +61,11 @@ function App() {
 
   const nearestDrop = useMemo(() => pickNearestDrop(state.pendingDrops), [state.pendingDrops]);
 
-  const runStateClass = state.isRunning ? (state.isPaused ? 'monitor-pill monitor-pill--paused' : 'monitor-pill monitor-pill--running') : 'monitor-pill monitor-pill--idle';
+  const runStateClass = state.isRunning
+    ? state.isPaused
+      ? 'monitor-pill monitor-pill--paused'
+      : 'monitor-pill monitor-pill--running'
+    : 'monitor-pill monitor-pill--idle';
   const runStateLabel = state.isRunning ? (state.isPaused ? 'PAUSED' : 'RUNNING') : 'IDLE';
 
   return (
@@ -99,7 +84,10 @@ function App() {
             <p className="monitor-drop-name">{nearestDrop.name}</p>
             <div className="monitor-drop-meta">{nearestDrop.gameName}</div>
             <div className="monitor-progress-track">
-              <div className="monitor-progress-fill" style={{ width: `${Math.max(0, Math.min(100, nearestDrop.progress))}%` }} />
+              <div
+                className="monitor-progress-fill"
+                style={{ width: `${Math.max(0, Math.min(100, nearestDrop.progress))}%` }}
+              />
             </div>
             <div className="monitor-progress-row">
               <span className="monitor-progress-left">{nearestDrop.progress}%</span>
@@ -107,12 +95,12 @@ function App() {
             </div>
           </div>
         ) : (
-          <div className="monitor-empty">Nessun reward pending per la campagna selezionata.</div>
+          <div className="monitor-empty">No pending rewards for the selected campaign.</div>
         )}
 
         <div className="monitor-footer">
           <span className="monitor-channel">
-            {state.activeStreamer ? `/${state.activeStreamer.displayName}` : 'Streamer non attivo'}
+            {state.activeStreamer ? `/${state.activeStreamer.displayName}` : 'No active streamer'}
           </span>
           <span className="monitor-updated">Updated {updatedLabel(lastUpdatedAt)}</span>
         </div>

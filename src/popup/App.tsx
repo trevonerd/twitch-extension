@@ -1,26 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AppState, ExpiryStatus, TwitchDrop, TwitchGame } from '../types';
 import { sortPendingDrops } from '../shared/drop-order.js';
-
-const createInitialState = (): AppState => ({
-  selectedGame: null,
-  isRunning: false,
-  isPaused: false,
-  activeStreamer: null,
-  currentDrop: null,
-  completedDrops: [],
-  pendingDrops: [],
-  allDrops: [],
-  availableGames: [],
-  queue: [],
-  workspaceWindowId: null,
-  monitorWindowId: null,
-  tabId: null,
-  directoryTabId: null,
-  dropsTabId: null,
-  inventoryTabId: null,
-  completionNotified: false,
-});
+import { createInitialState, isExpiredGame } from '../shared/utils';
+import { AppState, ExpiryStatus, TwitchDrop, TwitchGame } from '../types';
 
 function expiryLabel(status?: ExpiryStatus) {
   switch (status) {
@@ -66,19 +47,6 @@ function formatEtaMinutes(value?: number | null): string | null {
     return `${hours}h`;
   }
   return `${hours}h ${rem}m`;
-}
-
-function isGameExpired(game: TwitchGame): boolean {
-  if (typeof game.expiresInMs === 'number' && Number.isFinite(game.expiresInMs)) {
-    return game.expiresInMs <= 0;
-  }
-  if (game.endsAt) {
-    const endsAtMs = new Date(game.endsAt).getTime();
-    if (Number.isFinite(endsAtMs)) {
-      return endsAtMs <= Date.now();
-    }
-  }
-  return false;
 }
 
 /* ── SVG Icons ── */
@@ -145,8 +113,21 @@ function GitHubIcon() {
 function CoffeeIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M18 8h1a4 4 0 0 1 0 8h-1M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M6 1v3M10 1v3M14 1v3" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path
+        d="M18 8h1a4 4 0 0 1 0 8h-1M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M6 1v3M10 1v3M14 1v3"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
     </svg>
   );
 }
@@ -209,9 +190,7 @@ function CompactDropCard({ drop }: { drop: TwitchDrop }) {
         <div className="mt-1 h-1 w-full rounded-full bg-gray-800 overflow-hidden">
           <div
             className={`h-1 rounded-full transition-all duration-500 ${
-              drop.claimable
-                ? 'bg-yellow-400'
-                : 'bg-gradient-to-r from-twitch-purple to-pink-500'
+              drop.claimable ? 'bg-yellow-400' : 'bg-gradient-to-r from-twitch-purple to-pink-500'
             }`}
             style={{ width: `${drop.progress}%` }}
           />
@@ -260,11 +239,15 @@ function App() {
   }, []);
 
   const pendingDrops = useMemo(() => sortPendingDrops(state.pendingDrops), [state.pendingDrops]);
-  const completedDrops = useMemo(() => state.completedDrops, [state.completedDrops]);
-  const claimableCount = useMemo(() => state.pendingDrops.filter((d) => d.claimable).length, [state.pendingDrops]);
+  const completedDrops = state.completedDrops;
+  const claimableCount = useMemo(
+    () => state.pendingDrops.filter((d) => d.claimable).length,
+    [state.pendingDrops],
+  );
   const sortedGames = useMemo(
-    () => [...state.availableGames].filter((g) => !isGameExpired(g)).sort((a, b) => a.name.localeCompare(b.name)),
-    [state.availableGames]
+    () =>
+      [...state.availableGames].filter((g) => !isExpiredGame(g)).sort((a, b) => a.name.localeCompare(b.name)),
+    [state.availableGames],
   );
   const queueGames = useMemo(() => {
     const fallbackById = new Map(sortedGames.map((g) => [g.id, g]));
@@ -272,7 +255,9 @@ function App() {
   }, [state.queue, sortedGames]);
 
   const fetchAvailableGames = async (force = false) => {
-    await chrome.runtime.sendMessage({ type: 'ENSURE_GAMES_CACHE', payload: { force } }).catch(() => undefined);
+    await chrome.runtime
+      .sendMessage({ type: 'ENSURE_GAMES_CACHE', payload: { force } })
+      .catch(() => undefined);
     const latest = await chrome.storage.local.get(['appState']);
     if (latest.appState) {
       setState({ ...createInitialState(), ...latest.appState });
@@ -286,7 +271,9 @@ function App() {
       setQueueMessage(null);
       setRewardsLoading(true);
       try {
-        await chrome.runtime.sendMessage({ type: 'SET_SELECTED_GAME', payload: { game: selected } }).catch(() => undefined);
+        await chrome.runtime
+          .sendMessage({ type: 'SET_SELECTED_GAME', payload: { game: selected } })
+          .catch(() => undefined);
       } finally {
         setTimeout(() => setRewardsLoading(false), 350);
       }
@@ -351,17 +338,20 @@ function App() {
       await chrome.runtime.sendMessage({ type: 'START_FARMING', payload: { game: gameToStart } });
     });
 
-  const handlePause = () => withAction(async () => {
-    await chrome.runtime.sendMessage({ type: 'PAUSE_FARMING' });
-  });
+  const handlePause = () =>
+    withAction(async () => {
+      await chrome.runtime.sendMessage({ type: 'PAUSE_FARMING' });
+    });
 
-  const handleResume = () => withAction(async () => {
-    await chrome.runtime.sendMessage({ type: 'RESUME_FARMING' });
-  });
+  const handleResume = () =>
+    withAction(async () => {
+      await chrome.runtime.sendMessage({ type: 'RESUME_FARMING' });
+    });
 
-  const handleStop = () => withAction(async () => {
-    await chrome.runtime.sendMessage({ type: 'STOP_FARMING' });
-  });
+  const handleStop = () =>
+    withAction(async () => {
+      await chrome.runtime.sendMessage({ type: 'STOP_FARMING' });
+    });
 
   const openDropsPage = () => {
     chrome.tabs.create({ url: 'https://www.twitch.tv/drops/campaigns' });
@@ -374,7 +364,7 @@ function App() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12 text-gray-300">
-        <div className="spinner rounded-full h-8 w-8 border-3 border-twitch-purple border-t-transparent" />
+        <div className="spinner rounded-full h-8 w-8 border-[3px] border-twitch-purple border-t-transparent" />
       </div>
     );
   }
@@ -452,7 +442,10 @@ function App() {
         <div className="about-panel relative border-b border-white/10">
           <div className="px-4 py-3 space-y-2">
             <div className="flex items-center justify-between">
-              <p className="text-sm font-bold text-white">DropHunter <span className="text-purple-300 font-normal">v1.4.0</span></p>
+              <p className="text-sm font-bold text-white">
+                DropHunter{' '}
+                <span className="text-purple-300 font-normal">v{chrome.runtime.getManifest().version}</span>
+              </p>
               <button
                 type="button"
                 onClick={() => setShowAbout(false)}
@@ -461,7 +454,9 @@ function App() {
                 ×
               </button>
             </div>
-            <p className="text-[11px] text-gray-400">by <span className="text-gray-200">Marco Trevisani</span> (trevonerd)</p>
+            <p className="text-[11px] text-gray-400">
+              by <span className="text-gray-200">Marco Trevisani</span> (trevonerd)
+            </p>
             <p className="text-[11px] text-purple-300 font-semibold tracking-wide">TREVISOFT</p>
             <div className="flex items-center gap-3 pt-1">
               <button
@@ -492,13 +487,14 @@ function App() {
           <select
             value={state.selectedGame?.id ?? ''}
             onChange={(e) => void handleGameSelect(e.target.value)}
-            className="min-w-0 flex-1 glass-dark rounded-lg px-2 py-1.5 text-xs text-white bg-[#1F1F23] focus:outline-none focus:ring-1 focus:ring-twitch-purple [&>option]:bg-[#1F1F23] [&>option]:text-white"
+            className="min-w-0 flex-1 rounded-lg px-2 py-1.5 text-xs text-white bg-[#1F1F23] focus:outline-none focus:ring-1 focus:ring-twitch-purple [&>option]:bg-[#1F1F23] [&>option]:text-white"
             disabled={state.isRunning}
           >
             <option value="">Select a campaign...</option>
             {sortedGames.map((game) => (
               <option key={game.id} value={game.id}>
-                {game.isConnected === false ? '\u{1F512} ' : ''}{game.name} · {expiryLabel(game.expiryStatus)}
+                {game.isConnected === false ? '\u{1F512} ' : ''}
+                {game.name} · {expiryLabel(game.expiryStatus)}
               </option>
             ))}
           </select>
@@ -550,7 +546,11 @@ function App() {
             disabled={(!state.selectedGame && queueGames.length === 0) || actionLoading}
             className="w-full rounded-lg bg-green-600 py-2 text-sm font-semibold disabled:bg-gray-700 disabled:opacity-50 hover:bg-green-500 transition-colors"
           >
-            {actionLoading ? 'Starting...' : queueGames.length > 0 ? `Start Queue (${queueGames.length})` : 'Start Farming'}
+            {actionLoading
+              ? 'Starting...'
+              : queueGames.length > 0
+                ? `Start Queue (${queueGames.length})`
+                : 'Start Farming'}
           </button>
         )}
 
@@ -560,16 +560,22 @@ function App() {
             {state.activeStreamer && (
               <>
                 <span className="text-white font-medium">{state.activeStreamer.displayName}</span>
-                <span className="text-gray-500"> · {state.activeStreamer.viewerCount?.toLocaleString() ?? '?'} viewers</span>
+                <span className="text-gray-500">
+                  {' '}
+                  · {state.activeStreamer.viewerCount?.toLocaleString() ?? '?'} viewers
+                </span>
               </>
             )}
             {state.currentDrop && (
               <>
                 {state.activeStreamer && <span className="text-gray-500"> · </span>}
-                <span className="text-purple-300">{state.currentDrop.name} {state.currentDrop.progress}%</span>
-                {formatEtaMinutes(state.currentDrop.remainingMinutes) && (
-                  <span className="text-gray-500"> · ETA {formatEtaMinutes(state.currentDrop.remainingMinutes)}</span>
-                )}
+                <span className="text-purple-300">
+                  {state.currentDrop.name} {state.currentDrop.progress}%
+                </span>
+                {(() => {
+                  const eta = formatEtaMinutes(state.currentDrop.remainingMinutes);
+                  return eta ? <span className="text-gray-500"> · ETA {eta}</span> : null;
+                })()}
               </>
             )}
             {!state.activeStreamer && !state.currentDrop && (
