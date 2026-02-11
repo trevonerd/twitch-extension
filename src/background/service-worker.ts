@@ -359,7 +359,7 @@ function compareDropPriority(a: TwitchDrop, b: TwitchDrop): number {
 }
 
 function dropStateKey(drop: TwitchDrop): string {
-  return `${drop.campaignId ?? ''}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
+  return `${drop.id}::${drop.campaignId ?? ''}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
 }
 
 function dropMatchesSelectedGame(drop: TwitchDrop, selected: TwitchGame): boolean {
@@ -799,22 +799,29 @@ function normalizeToken(value: string): string {
 }
 
 function scoreDropMatch(base: TwitchDrop, candidate: TwitchDrop): number {
+  // Exact ID match is definitive
+  if (base.id && candidate.id && base.id === candidate.id) {
+    return 1000;
+  }
   const baseName = normalizeToken(base.name);
   const candidateName = normalizeToken(candidate.name);
   const baseGame = normalizeToken(base.gameName);
   const candidateGame = normalizeToken(candidate.gameName);
   let score = 0;
   if (baseName === candidateName) {
-    score += 100;
+    score += 40;
   }
   if (candidateName.includes(baseName) || baseName.includes(candidateName)) {
-    score += 30;
+    score += 15;
   }
   if (baseGame && candidateGame && (baseGame.includes(candidateGame) || candidateGame.includes(baseGame))) {
     score += 20;
   }
   if (base.imageUrl && candidate.imageUrl && base.imageUrl === candidate.imageUrl) {
-    score += 80;
+    score += 40;
+  }
+  if (base.campaignId && candidate.campaignId && base.campaignId === candidate.campaignId) {
+    score += 30;
   }
   return score;
 }
@@ -1752,16 +1759,22 @@ function mergeDropsWithInventory(campaignDrops: TwitchDrop[], inventoryDrops: Tw
     return campaignDrops;
   }
 
+  // Track which inventory drops have been consumed so each is matched at most once
+  const consumedInventory = new Set<number>();
+
   const merged = campaignDrops.map((drop) => {
-    const match = inventoryDrops
-      .map((candidate) => ({ candidate, score: scoreDropMatch(drop, candidate) }))
+    const scored = inventoryDrops
+      .map((candidate, idx) => ({ candidate, idx, score: consumedInventory.has(idx) ? -1 : scoreDropMatch(drop, candidate) }))
       .sort((a, b) => b.score - a.score)[0];
 
-    if (!match || match.score < 70) {
+    if (!scored || scored.score < 70) {
       return drop;
     }
 
-    const inventoryDrop = match.candidate;
+    // Consume this inventory drop so it can't match another campaign drop
+    consumedInventory.add(scored.idx);
+
+    const inventoryDrop = scored.candidate;
     const mergedProgress = inventoryDrop.progressSource === 'inventory' ? inventoryDrop.progress : Math.max(drop.progress, inventoryDrop.progress);
     const mergedClaimed = drop.claimed || inventoryDrop.claimed;
     const mergedClaimable = Boolean(drop.claimable) || Boolean(inventoryDrop.claimable);
@@ -1786,10 +1799,15 @@ function mergeDropsWithInventory(campaignDrops: TwitchDrop[], inventoryDrops: Tw
     };
   });
 
-  const mergedKeys = new Set(merged.map((drop) => `${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`));
+  // Include drop.id in dedup key so same-named drops aren't filtered out
+  const mergedKeys = new Set(merged.map((drop) => `${drop.id}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`));
   const selectedGameName = normalizeToken(appState.selectedGame?.name ?? '');
-  const extras = inventoryDrops.filter((drop) => {
-    const key = `${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
+  const extras = inventoryDrops.filter((drop, idx) => {
+    // Already consumed by a campaign drop merge
+    if (consumedInventory.has(idx)) {
+      return false;
+    }
+    const key = `${drop.id}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
     if (mergedKeys.has(key)) {
       return false;
     }

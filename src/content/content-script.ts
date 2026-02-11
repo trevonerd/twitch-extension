@@ -894,11 +894,11 @@ function extractClaimedInventoryDrops(): TwitchDrop[] {
     });
   });
 
+  // Use drop.id for dedup — each drop already has a unique ID (e.g. inventory-claimed-lootbox-3)
   const unique = new Map<string, TwitchDrop>();
   claimed.forEach((drop) => {
-    const key = `${toId(drop.name)}::${toId(drop.imageUrl)}`;
-    if (!unique.has(key)) {
-      unique.set(key, drop);
+    if (!unique.has(drop.id)) {
+      unique.set(drop.id, drop);
     }
   });
   return Array.from(unique.values());
