@@ -273,7 +273,7 @@ function extractBenefitIds(drop: Record<string, unknown>): string[] {
 }
 
 /** Lookup of claimed rewards from inventory gameEventDrops, keyed by normalized game name */
-interface ClaimedRewardEntry { names: Set<string>; ids: Set<string>; }
+interface ClaimedRewardEntry { nameCounts: Map<string, number>; idCounts: Map<string, number>; }
 type ClaimedRewardLookup = Map<string, ClaimedRewardEntry>;
 
 function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
@@ -302,34 +302,21 @@ function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
     if (!gameName || (!rewardName && !benefitId)) return;
 
     if (!lookup.has(gameName)) {
-      lookup.set(gameName, { names: new Set(), ids: new Set() });
+      lookup.set(gameName, { nameCounts: new Map(), idCounts: new Map() });
     }
     const entry = lookup.get(gameName)!;
-    if (rewardName) entry.names.add(rewardName);
-    if (benefitId) entry.ids.add(benefitId);
+    if (rewardName) entry.nameCounts.set(rewardName, (entry.nameCounts.get(rewardName) ?? 0) + 1);
+    if (benefitId) entry.idCounts.set(benefitId, (entry.idCounts.get(benefitId) ?? 0) + 1);
     console.info(`[buildClaimedRewardLookup] game="${gameName}" claimedName="${rewardName}" benefitId="${benefitId}"`);
   });
 
   lookup.forEach((entry, gameName) => {
-    console.info(`[buildClaimedRewardLookup] SUMMARY game="${gameName}" claimedNames=[${Array.from(entry.names).join(', ')}] claimedIds=[${Array.from(entry.ids).join(', ')}]`);
+    const nameEntries = Array.from(entry.nameCounts.entries()).map(([n, c]) => `${n}(x${c})`).join(', ');
+    const idEntries = Array.from(entry.idCounts.entries()).map(([id, c]) => `${id}(x${c})`).join(', ');
+    console.info(`[buildClaimedRewardLookup] SUMMARY game="${gameName}" claimedNames=[${nameEntries}] claimedIdCounts=[${idEntries}]`);
   });
 
   return lookup;
-}
-
-function buildGlobalClaimedBenefitIds(inventoryRaw: unknown): Set<string> {
-  const ids = new Set<string>();
-  if (!inventoryRaw || typeof inventoryRaw !== 'object') return ids;
-  const inventory = inventoryRaw as Record<string, unknown>;
-  const gameEventDrops = Array.isArray(inventory.gameEventDrops)
-    ? (inventory.gameEventDrops as Array<Record<string, unknown>>)
-    : [];
-  gameEventDrops.forEach((drop) => {
-    if (!drop || typeof drop !== 'object') return;
-    const benefitId = normalizeText(drop.id);
-    if (benefitId) ids.add(benefitId);
-  });
-  return ids;
 }
 
 function isCampaignConnected(campaign: Record<string, unknown>): boolean {
@@ -402,7 +389,7 @@ function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | 
   };
 }
 
-function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame, inventoryMaps: InventoryDropMaps, claimedRewards: ClaimedRewardLookup, globalClaimedBenefitIds: Set<string>, inProgressCampaignIds: Set<string>): TwitchDrop[] {
+function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame, inventoryMaps: InventoryDropMaps, claimedRewards: ClaimedRewardLookup): TwitchDrop[] {
   const campaignId = normalizeText(campaign.id) || game.campaignId || '';
   const campaignEndsAt = toIsoDate(campaign.endAt);
   const timeBasedDrops = Array.isArray(campaign.timeBasedDrops) ? (campaign.timeBasedDrops as Array<Record<string, unknown>>) : [];
@@ -420,13 +407,34 @@ function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame,
     // Check if any of this drop's benefit rewards appear in the user's claimed gameEventDrops
     const benefitNames = extractBenefitNames(drop);
     const benefitIds = extractBenefitIds(drop);
-    const idMatch = gameClaimedRewards != null && benefitIds.some((id) => gameClaimedRewards.ids.has(id));
-    const nameMatch = gameClaimedRewards != null && benefitNames.some((name) => gameClaimedRewards.names.has(name));
-    const globalIdMatch = benefitIds.some((id) => globalClaimedBenefitIds.has(id));
+    // ID match with consumption: decrement count so duplicate-ID drops aren't all marked claimed
+    let idMatch = false;
+    if (gameClaimedRewards != null) {
+      for (const id of benefitIds) {
+        const remaining = gameClaimedRewards.idCounts.get(id) ?? 0;
+        if (remaining > 0) {
+          idMatch = true;
+          gameClaimedRewards.idCounts.set(id, remaining - 1);
+          break;
+        }
+      }
+    }
+    // Name match: only if idMatch didn't already consume, to avoid double-counting
+    let nameMatch = false;
+    if (!idMatch && gameClaimedRewards != null) {
+      for (const name of benefitNames) {
+        const remaining = gameClaimedRewards.nameCounts.get(name) ?? 0;
+        if (remaining > 0) {
+          nameMatch = true;
+          gameClaimedRewards.nameCounts.set(name, remaining - 1);
+          break;
+        }
+      }
+    }
     const claimedFromGameEvents = idMatch || nameMatch;
     const claimedFromInventory = inventoryState?.claimed ?? Boolean(self.isClaimed ?? drop.isClaimed);
-    const claimed = claimedFromGameEvents || claimedFromInventory || globalIdMatch;
-    console.info(`[parseCampaignDrops] drop="${normalizeText(drop.name)}" game="${game.name}" benefitIds=[${benefitIds.join(', ')}] benefitNames=[${benefitNames.join(', ')}] idMatch=${idMatch} nameMatch=${nameMatch} globalIdMatch=${globalIdMatch} claimedFromGameEvents=${claimedFromGameEvents} claimedFromInventory=${claimedFromInventory} claimed=${claimed} hasGameClaimedRewards=${gameClaimedRewards != null}`);
+    const claimed = claimedFromGameEvents || claimedFromInventory;
+    console.info(`[parseCampaignDrops] drop="${normalizeText(drop.name)}" game="${game.name}" benefitIds=[${benefitIds.join(', ')}] benefitNames=[${benefitNames.join(', ')}] idMatch=${idMatch} nameMatch=${nameMatch} claimedFromGameEvents=${claimedFromGameEvents} claimedFromInventory=${claimedFromInventory} claimed=${claimed} hasGameClaimedRewards=${gameClaimedRewards != null}`);
     const claimableFromApi = inventoryState?.claimable ?? Boolean(self.isClaimable ?? self.canClaim);
     const claimableFromProgress = Boolean(!claimed && requiredMinutes !== null && requiredMinutes > 0 && currentMinutes >= requiredMinutes);
     const hasDropInstance = Boolean(claimId) && !claimed;
@@ -450,41 +458,27 @@ function parseCampaignDrops(campaign: Record<string, unknown>, game: TwitchGame,
     const endsAt = inventoryState?.endsAt ?? toIsoDate(drop.endAt) ?? campaignEndsAt;
 
     return {
-      drop: {
-        id: dropId,
-        claimId: claimId || undefined,
-        name,
-        gameId: game.id,
-        gameName: game.name,
-        imageUrl,
-        categorySlug: game.categorySlug,
-        progress,
-        claimed,
-        claimable,
-        campaignId: campaignId || undefined,
-        endsAt,
-        expiresInMs: computeExpiry(endsAt).expiresInMs,
-        status: normalizeDropStatus(progress, claimed, claimable),
-        requiredMinutes,
-        remainingMinutes,
-        progressSource: 'campaign',
-      } satisfies TwitchDrop,
-      claimedCertain: claimedFromInventory || claimedFromGameEvents,
-    };
+      id: dropId,
+      claimId: claimId || undefined,
+      name,
+      gameId: game.id,
+      gameName: game.name,
+      imageUrl,
+      categorySlug: game.categorySlug,
+      progress,
+      claimed,
+      claimable,
+      campaignId: campaignId || undefined,
+      endsAt,
+      expiresInMs: computeExpiry(endsAt).expiresInMs,
+      status: normalizeDropStatus(progress, claimed, claimable),
+      requiredMinutes,
+      remainingMinutes,
+      progressSource: 'campaign',
+    } satisfies TwitchDrop;
   });
 
-  // Heuristic: if campaign is NOT in progress and at least one drop is claimed via a certain source
-  // (inventory or game events, NOT just globalIdMatch), mark ALL drops as completed.
-  // This avoids false positives from cross-campaign benefit ID collisions.
-  const hasCertainClaim = parsedDrops.some((d) => d.claimedCertain);
-  if (!inProgressCampaignIds.has(campaignId) && hasCertainClaim) {
-    return parsedDrops.map((d) => d.drop.claimed ? d.drop : {
-      ...d.drop, claimed: true, claimable: false, progress: 100,
-      remainingMinutes: 0, status: 'completed' as const,
-    });
-  }
-
-  return parsedDrops.map((d) => d.drop);
+  return parsedDrops;
 }
 
 function parseViewerCount(node: Record<string, unknown>): number {
@@ -600,19 +594,7 @@ export class TwitchApiClient {
     }
     const inventoryMaps = buildInventoryDropMaps(inventoryRaw);
     const claimedRewards = buildClaimedRewardLookup(inventoryRaw);
-    const globalClaimedBenefitIds = buildGlobalClaimedBenefitIds(inventoryRaw);
-    const inProgressCampaignIds = new Set<string>();
-    if (inventoryRaw && typeof inventoryRaw === 'object') {
-      const inv = inventoryRaw as Record<string, unknown>;
-      const campaignsInProgress = Array.isArray(inv.dropCampaignsInProgress)
-        ? (inv.dropCampaignsInProgress as Array<Record<string, unknown>>)
-        : [];
-      campaignsInProgress.forEach((c) => {
-        const id = normalizeText(c?.id);
-        if (id) inProgressCampaignIds.add(id);
-      });
-    }
-    console.info(`[TwitchApiClient] Inventory maps: ${inventoryMaps.byCampaignDrop.size} campaign::drop entries, ${inventoryMaps.byDropId.size} drop entries, ${claimedRewards.size} games with claimed rewards, ${globalClaimedBenefitIds.size} global claimed benefit IDs, ${inProgressCampaignIds.size} in-progress campaigns`);
+    console.info(`[TwitchApiClient] Inventory maps: ${inventoryMaps.byCampaignDrop.size} campaign::drop entries, ${inventoryMaps.byDropId.size} drop entries, ${claimedRewards.size} games with claimed rewards`);
 
     // Filter to usable (non-expired) campaigns — show all, not just connected ones
     const usableCampaigns = campaigns.filter(
@@ -651,7 +633,7 @@ export class TwitchApiClient {
         campaignChannelsMap[campaignId] = game.allowedChannels ?? null;
       }
 
-      const campaignDrops = parseCampaignDrops(mergedCampaign, game, inventoryMaps, claimedRewards, globalClaimedBenefitIds, inProgressCampaignIds);
+      const campaignDrops = parseCampaignDrops(mergedCampaign, game, inventoryMaps, claimedRewards);
       games.push({
         ...game,
         dropCount: campaignDrops.length,
