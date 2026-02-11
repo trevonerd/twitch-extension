@@ -1,20 +1,31 @@
-import { AppState, DropStatus, DropsSnapshot, Message, TwitchDrop, TwitchGame, TwitchStreamer } from '../types';
+import { isDropCompleted, mergeDropProgressMonotonic } from '../shared/drops';
+import { normalizeToken, tokenOverlapScore } from '../shared/matching';
+import { createInitialState, isExpiredGame, toSlug } from '../shared/utils';
+import { AppState, DropsSnapshot, Message, TwitchDrop, TwitchGame, TwitchStreamer } from '../types';
 import { TwitchApiClient } from './twitch-api/client';
 import { fetchTwitchIntegrityToken } from './twitch-api/gql';
 import { isLikelyAuthError, sanitizeTwitchSession, TwitchSession } from './twitch-api/types';
 
-const DROPS_TAG_ID = 'c2542d6d-cd10-4532-919b-3d19f30a768b';
 const PROGRESS_POLL_MS = 15_000;
+const FULL_REFRESH_INTERVAL_MS = 2 * 60_000;
 const INVALID_STREAM_THRESHOLD = 8;
 const STREAM_ROTATE_COOLDOWN_MS = 5 * 60_000;
 const STREAM_VALIDATION_GRACE_MS = 75_000;
-const INVENTORY_REFRESH_INTERVAL_MS = 90_000;
 const TWITCH_SESSION_RETRY_COOLDOWN_MS = 5_000;
 const DROP_CLAIM_RETRY_COOLDOWN_MS = 45_000;
 const TWITCH_SESSION_STORAGE_KEY = 'twitchSession';
 const DROPS_SNAPSHOT_CACHE_KEY = 'dropsSnapshotCache';
+const TIMING_STATE_KEY = 'timingState';
+const ALARM_NAME = 'dropCheck';
 const LOG_PREFIX = '[DropHunter]';
-const ENABLE_CONTENT_FALLBACK = false;
+
+interface TimingState {
+  lastStreamRotationAt: number;
+  streamValidationGraceUntil: number;
+  invalidStreamChecks: number;
+  twitchSessionLastAttemptAt: number;
+  dropClaimRetryAtById: Record<string, number>;
+}
 
 interface StreamContext {
   channelName: string;
@@ -27,8 +38,14 @@ interface StreamContext {
   pageUrl: string;
 }
 
+const DEBUG = true;
+
 function logInfo(...args: unknown[]) {
   console.info(LOG_PREFIX, ...args);
+}
+
+function logDebug(...args: unknown[]) {
+  if (DEBUG) console.debug(LOG_PREFIX, ...args);
 }
 
 function logWarn(...args: unknown[]) {
@@ -50,45 +67,55 @@ function sessionDebugSummary(session: TwitchSession | null) {
   };
 }
 
-const createInitialState = (): AppState => ({
-  selectedGame: null,
-  isRunning: false,
-  isPaused: false,
-  activeStreamer: null,
-  currentDrop: null,
-  completedDrops: [],
-  pendingDrops: [],
-  allDrops: [],
-  availableGames: [],
-  queue: [],
-  workspaceWindowId: null,
-  monitorWindowId: null,
-  tabId: null,
-  directoryTabId: null,
-  dropsTabId: null,
-  inventoryTabId: null,
-  completionNotified: false,
-});
-
 function sameCampaignId(left?: string | null, right?: string | null): boolean {
   return Boolean(left && right && left === right);
 }
 
 let appState: AppState = createInitialState();
-let monitoringInterval: number | null = null;
 let monitorTickInFlight = false;
 let invalidStreamChecks = 0;
 let lastStreamRotationAt = 0;
 let streamValidationGraceUntil = 0;
-let lastInventoryRefreshAt = 0;
 let gamesCacheRefreshInFlight: Promise<TwitchGame[]> | null = null;
 let twitchSessionCache: TwitchSession | null = null;
 let twitchSessionFetchInFlight: Promise<TwitchSession | null> | null = null;
 let twitchSessionLastAttemptAt = 0;
 let cachedDropsSnapshot: TwitchDrop[] = [];
 let cachedCampaignChannelsMap: Record<string, string[] | null> = {};
+let lastFullRefreshAt = 0;
 let dropClaimInFlight = false;
 const dropClaimRetryAtById = new Map<string, number>();
+
+async function saveTimingState() {
+  const state: TimingState = {
+    lastStreamRotationAt,
+    streamValidationGraceUntil,
+    invalidStreamChecks,
+    twitchSessionLastAttemptAt,
+    dropClaimRetryAtById: Object.fromEntries(dropClaimRetryAtById),
+  };
+  await chrome.storage.session.set({ [TIMING_STATE_KEY]: state }).catch(() => undefined);
+}
+
+async function loadTimingState() {
+  try {
+    const result = await chrome.storage.session.get([TIMING_STATE_KEY]);
+    const saved = result[TIMING_STATE_KEY] as TimingState | undefined;
+    if (!saved) return;
+    lastStreamRotationAt = saved.lastStreamRotationAt ?? 0;
+    streamValidationGraceUntil = saved.streamValidationGraceUntil ?? 0;
+    invalidStreamChecks = saved.invalidStreamChecks ?? 0;
+    twitchSessionLastAttemptAt = saved.twitchSessionLastAttemptAt ?? 0;
+    if (saved.dropClaimRetryAtById) {
+      dropClaimRetryAtById.clear();
+      for (const [id, at] of Object.entries(saved.dropClaimRetryAtById)) {
+        dropClaimRetryAtById.set(id, at);
+      }
+    }
+  } catch {
+    // Ignore: session storage may not be available
+  }
+}
 
 chrome.runtime.onStartup.addListener(async () => {
   await loadState();
@@ -96,12 +123,20 @@ chrome.runtime.onStartup.addListener(async () => {
 
 chrome.runtime.onInstalled.addListener(async (details) => {
   if (details.reason === 'update') {
+    // Reset state on extension update to prevent stale/corrupt state from persisting
     appState = createInitialState();
+    cachedDropsSnapshot = [];
     await chrome.storage.local.set({ appState });
     broadcastStateUpdate();
     return;
   }
   await loadState();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === ALARM_NAME) {
+    checkDropProgress().catch((error) => logWarn('Monitoring error:', String(error)));
+  }
 });
 
 function normalizeGameSelection(games: TwitchGame[]) {
@@ -119,19 +154,6 @@ function normalizeQueueSelection(games: TwitchGame[]) {
     appState.queue = [];
     return;
   }
-
-  const isExpiredGame = (game: TwitchGame): boolean => {
-    if (typeof game.expiresInMs === 'number' && Number.isFinite(game.expiresInMs)) {
-      return game.expiresInMs <= 0;
-    }
-    if (game.endsAt) {
-      const endsAtMs = new Date(game.endsAt).getTime();
-      if (Number.isFinite(endsAtMs)) {
-        return endsAtMs <= Date.now();
-      }
-    }
-    return false;
-  };
 
   const normalized: TwitchGame[] = [];
   const seen = new Set<string>();
@@ -185,15 +207,13 @@ function choosePreferredGame(candidates: TwitchGame[]): TwitchGame | null {
   if (!Array.isArray(candidates) || candidates.length === 0) {
     return null;
   }
-  return candidates
-    .slice()
-    .sort((left, right) => {
-      const byScore = gameSpecificityScore(right) - gameSpecificityScore(left);
-      if (byScore !== 0) {
-        return byScore;
-      }
-      return left.name.localeCompare(right.name);
-    })[0];
+  return candidates.slice().sort((left, right) => {
+    const byScore = gameSpecificityScore(right) - gameSpecificityScore(left);
+    if (byScore !== 0) {
+      return byScore;
+    }
+    return left.name.localeCompare(right.name);
+  })[0];
 }
 
 function dedupeAvailableGames(games: TwitchGame[]): TwitchGame[] {
@@ -212,7 +232,8 @@ function dedupeAvailableGames(games: TwitchGame[]): TwitchGame[] {
       const preferred = choosePreferredGame(withCampaign);
       if (preferred) {
         const totalDrops = withCampaign.reduce(
-          (sum, g) => sum + (typeof g.dropCount === 'number' && Number.isFinite(g.dropCount) ? g.dropCount : 0),
+          (sum, g) =>
+            sum + (typeof g.dropCount === 'number' && Number.isFinite(g.dropCount) ? g.dropCount : 0),
           0,
         );
         const hasUnrestricted = withCampaign.some((g) => !g.allowedChannels);
@@ -236,24 +257,14 @@ function dedupeAvailableGames(games: TwitchGame[]): TwitchGame[] {
   return deduped.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function tokenOverlapScore(left: string, right: string): number {
-  const leftTokens = new Set(normalizeToken(left).split(' ').filter((token) => token.length >= 3));
-  const rightTokens = new Set(normalizeToken(right).split(' ').filter((token) => token.length >= 3));
-  if (leftTokens.size === 0 || rightTokens.size === 0) {
-    return 0;
-  }
-  let overlap = 0;
-  leftTokens.forEach((token) => {
-    if (rightTokens.has(token)) {
-      overlap += 1;
-    }
-  });
-  return overlap / Math.max(leftTokens.size, rightTokens.size);
-}
-
 function findMatchingGame(target: TwitchGame, source: TwitchGame[]): TwitchGame | null {
   const targetKey = gameKey(target);
-  const exact = source.find((game) => game.id === target.id || sameCampaignId(game.campaignId, target.campaignId) || gameKey(game) === targetKey);
+  const exact = source.find(
+    (game) =>
+      game.id === target.id ||
+      sameCampaignId(game.campaignId, target.campaignId) ||
+      gameKey(game) === targetKey,
+  );
   if (exact) {
     return exact;
   }
@@ -270,7 +281,11 @@ function findMatchingGame(target: TwitchGame, source: TwitchGame[]): TwitchGame 
     if (targetName && candidateName && targetName === candidateName) {
       score += 100;
     }
-    if (targetName && candidateName && (candidateName.includes(targetName) || targetName.includes(candidateName))) {
+    if (
+      targetName &&
+      candidateName &&
+      (candidateName.includes(targetName) || targetName.includes(candidateName))
+    ) {
       score += 40;
     }
     score += Math.round(tokenOverlapScore(targetName, candidateName) * 40);
@@ -287,19 +302,6 @@ function findMatchingGame(target: TwitchGame, source: TwitchGame[]): TwitchGame 
 }
 
 function mergeAvailableGames(existing: TwitchGame[], incoming: TwitchGame[]): TwitchGame[] {
-  const isExpiredGame = (game: TwitchGame): boolean => {
-    if (typeof game.expiresInMs === 'number' && Number.isFinite(game.expiresInMs)) {
-      return game.expiresInMs <= 0;
-    }
-    if (game.endsAt) {
-      const endsAtMs = new Date(game.endsAt).getTime();
-      if (Number.isFinite(endsAtMs)) {
-        return endsAtMs <= Date.now();
-      }
-    }
-    return false;
-  };
-
   const merged = new Map<string, TwitchGame>();
   const upsert = (game: TwitchGame) => {
     if (isExpiredGame(game)) {
@@ -332,7 +334,7 @@ function mergeAvailableGames(existing: TwitchGame[], incoming: TwitchGame[]): Tw
   const filtered = Array.from(merged.values()).filter((game) => !isExpiredGame(game));
   const deduped = dedupeAvailableGames(filtered);
   if (filtered.length !== deduped.length) {
-    logInfo('Collapsed duplicate games after merge', {
+    logDebug('Collapsed duplicate games after merge', {
       before: filtered.length,
       after: deduped.length,
     });
@@ -375,40 +377,9 @@ function dropMatchesSelectedGame(drop: TwitchDrop, selected: TwitchGame): boolea
       selectedName.includes(dropName) ||
       tokenOverlapScore(dropName, selectedName) > 0.5);
   const dropCategory = normalizeToken(drop.categorySlug ?? toSlug(drop.gameName));
-  const byCategory = selectedCategory.length > 0 && dropCategory.length > 0 && selectedCategory === dropCategory;
+  const byCategory =
+    selectedCategory.length > 0 && dropCategory.length > 0 && selectedCategory === dropCategory;
   return byId || byCampaign || byName || byCategory;
-}
-
-function mergeDropProgressMonotonic(nextDrop: TwitchDrop, previousDrop: TwitchDrop): TwitchDrop {
-  const mergedProgress = Math.max(nextDrop.progress, previousDrop.progress);
-  const mergedClaimed = nextDrop.claimed || previousDrop.claimed;
-  const mergedClaimable = mergedClaimed ? false : Boolean(nextDrop.claimable);
-  const mergedRequiredMinutes = nextDrop.requiredMinutes ?? previousDrop.requiredMinutes ?? null;
-  const mergedRemainingMinutes =
-    mergedClaimed || mergedClaimable
-      ? 0
-      : nextDrop.remainingMinutes !== undefined && nextDrop.remainingMinutes !== null
-        ? previousDrop.remainingMinutes !== undefined && previousDrop.remainingMinutes !== null
-          ? Math.min(previousDrop.remainingMinutes, nextDrop.remainingMinutes)
-          : nextDrop.remainingMinutes
-        : previousDrop.remainingMinutes ?? null;
-
-  return {
-    ...nextDrop,
-    progress: mergedClaimed || mergedClaimable ? 100 : mergedProgress,
-    claimed: mergedClaimed,
-    claimable: mergedClaimable,
-    imageUrl: nextDrop.imageUrl || previousDrop.imageUrl,
-    campaignId: nextDrop.campaignId || previousDrop.campaignId,
-    requiredMinutes: mergedRequiredMinutes,
-    remainingMinutes: mergedRemainingMinutes,
-    progressSource: nextDrop.progressSource ?? previousDrop.progressSource,
-    status: mergedClaimed ? 'completed' : mergedClaimable ? 'pending' : mergedProgress > 0 ? 'active' : 'pending',
-  };
-}
-
-function isDropCompleted(drop: TwitchDrop): boolean {
-  return drop.claimed || (drop.progress >= 100 && !drop.claimable);
 }
 
 function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
@@ -421,7 +392,45 @@ function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
     return;
   }
 
+  logInfo('splitDropsForSelectedGame called', {
+    allDropsCount: allDrops.length,
+    selectedId: selected.id,
+    selectedCampaignId: selected.campaignId ?? null,
+    selectedName: selected.name,
+    selectedCategory: selected.categorySlug ?? null,
+    sampleDrops: allDrops.slice(0, 3).map((d) => ({
+      gameId: d.gameId,
+      gameName: d.gameName,
+      campaignId: d.campaignId ?? null,
+      categorySlug: d.categorySlug ?? null,
+    })),
+  });
+
   const strictRelevant = allDrops.filter((drop) => dropMatchesSelectedGame(drop, selected));
+
+  if (strictRelevant.length === 0 && allDrops.length > 0) {
+    const sample = allDrops[0];
+    const selectedName = normalizeToken(selected.name);
+    const selectedCategory = normalizeToken(selected.categorySlug ?? toSlug(selected.name));
+    const dropName = normalizeToken(sample.gameName);
+    const dropCategory = normalizeToken(sample.categorySlug ?? toSlug(sample.gameName));
+    logWarn('Zero strict matches — sample drop match debug', {
+      selectedId: selected.id,
+      selectedCampaignId: selected.campaignId ?? null,
+      selectedNameNorm: selectedName,
+      selectedCategoryNorm: selectedCategory,
+      dropGameId: sample.gameId,
+      dropCampaignId: sample.campaignId ?? null,
+      dropNameNorm: dropName,
+      dropCategoryNorm: dropCategory,
+      byId: sample.gameId === selected.id,
+      byCampaign: sameCampaignId(sample.campaignId, selected.campaignId),
+      byNameExact: dropName === selectedName,
+      byNameIncludes: dropName.includes(selectedName) || selectedName.includes(dropName),
+      byCategory: selectedCategory.length > 0 && dropCategory.length > 0 && selectedCategory === dropCategory,
+      uniqueGameNames: Array.from(new Set(allDrops.map((d) => d.gameName))).slice(0, 10),
+    });
+  }
   const selectedName = normalizeToken(selected.name);
   const relaxedRelevant =
     strictRelevant.length > 0
@@ -430,7 +439,9 @@ function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
           const dropName = normalizeToken(drop.gameName);
           return (
             selectedName.length > 0 &&
-            (dropName.includes(selectedName) || selectedName.includes(dropName) || tokenOverlapScore(dropName, selectedName) > 0.5)
+            (dropName.includes(selectedName) ||
+              selectedName.includes(dropName) ||
+              tokenOverlapScore(dropName, selectedName) > 0.5)
           );
         });
 
@@ -475,21 +486,26 @@ function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
 
   const relevantForState = mergedRelevant;
 
-  const completed = relevantForState.filter((drop) => isDropCompleted(drop)).map((drop) => ({ ...drop, status: 'completed' as const }));
+  const completed = relevantForState
+    .filter((drop) => isDropCompleted(drop))
+    .map((drop) => ({ ...drop, status: 'completed' as const }));
   const pending = relevantForState.filter((drop) => !isDropCompleted(drop));
   const normalizedPending = pending.map((drop) => ({
     ...drop,
     status: drop.progress > 0 || Boolean(drop.claimable) ? ('active' as const) : ('pending' as const),
   }));
   const activeCandidates = normalizedPending.filter((drop) => drop.progress > 0 || Boolean(drop.claimable));
-  const activeDrop = (activeCandidates.length > 0 ? activeCandidates : normalizedPending).slice().sort(compareDropPriority)[0] ?? null;
+  const activeDrop =
+    (activeCandidates.length > 0 ? activeCandidates : normalizedPending)
+      .slice()
+      .sort(compareDropPriority)[0] ?? null;
 
   appState.allDrops = relevantForState;
   appState.completedDrops = completed;
   appState.pendingDrops = normalizedPending;
   appState.currentDrop = activeDrop ? { ...activeDrop, status: 'active' } : null;
 
-  logInfo('Selected game rewards updated', {
+  logDebug('Selected game rewards updated', {
     selectedGame: selected.name,
     total: relevantForState.length,
     pending: normalizedPending.length,
@@ -506,21 +522,10 @@ function updateStateFromSnapshot(snapshot: DropsSnapshot) {
     cachedCampaignChannelsMap = snapshot.campaignChannelsMap;
   }
   // Replace instead of merge when API provides games
-  const isExpired = (game: TwitchGame): boolean => {
-    if (typeof game.expiresInMs === 'number' && Number.isFinite(game.expiresInMs)) {
-      return game.expiresInMs <= 0;
-    }
-    if (game.endsAt) {
-      const endsAtMs = new Date(game.endsAt).getTime();
-      if (Number.isFinite(endsAtMs)) {
-        return endsAtMs <= Date.now();
-      }
-    }
-    return false;
-  };
-  const orderedGames = snapshot.games.length > 0
-    ? dedupeAvailableGames(snapshot.games.filter((g) => !isExpired(g)))
-    : appState.availableGames;
+  const orderedGames =
+    snapshot.games.length > 0
+      ? dedupeAvailableGames(snapshot.games.filter((g) => !isExpiredGame(g)))
+      : appState.availableGames;
   appState.availableGames = orderedGames;
   normalizeGameSelection(orderedGames);
   normalizeQueueSelection(orderedGames);
@@ -540,15 +545,12 @@ async function loadState() {
         appState.queue = [];
       }
     }
-    if (!ENABLE_CONTENT_FALLBACK) {
-      appState.workspaceWindowId = null;
-      appState.directoryTabId = null;
-      appState.dropsTabId = null;
-      appState.inventoryTabId = null;
-    }
     twitchSessionCache = sanitizeTwitchSession(result[TWITCH_SESSION_STORAGE_KEY] as unknown);
-    logInfo('Initial Twitch session state from storage', sessionDebugSummary(twitchSessionCache));
-    cachedDropsSnapshot = Array.isArray(result[DROPS_SNAPSHOT_CACHE_KEY]) ? (result[DROPS_SNAPSHOT_CACHE_KEY] as TwitchDrop[]) : [];
+    logDebug('Initial Twitch session state from storage', sessionDebugSummary(twitchSessionCache));
+    cachedDropsSnapshot = Array.isArray(result[DROPS_SNAPSHOT_CACHE_KEY])
+      ? (result[DROPS_SNAPSHOT_CACHE_KEY] as TwitchDrop[])
+      : [];
+    await loadTimingState();
     if (appState.isRunning && !appState.isPaused) {
       startMonitoring();
     }
@@ -557,13 +559,20 @@ async function loadState() {
   }
 }
 
-function shouldRefreshGamesCache(_force = false): boolean {
-  return true;
+const GAMES_CACHE_TTL_MS = 5 * 60_000;
+let lastGamesCacheRefreshAt = 0;
+
+function shouldRefreshGamesCache(force = false): boolean {
+  if (force) return true;
+  return Date.now() - lastGamesCacheRefreshAt >= GAMES_CACHE_TTL_MS;
 }
 
 async function ensureStateHydratedForCache() {
   const hasRuntimeState =
-    appState.availableGames.length > 0 || appState.queue.length > 0 || Boolean(appState.selectedGame) || appState.isRunning;
+    appState.availableGames.length > 0 ||
+    appState.queue.length > 0 ||
+    Boolean(appState.selectedGame) ||
+    appState.isRunning;
   if (hasRuntimeState) {
     return;
   }
@@ -576,10 +585,12 @@ async function saveState() {
 }
 
 function broadcastStateUpdate() {
-  chrome.runtime.sendMessage({
-    type: 'UPDATE_STATE',
-    payload: appState,
-  }).catch(() => undefined);
+  chrome.runtime
+    .sendMessage({
+      type: 'UPDATE_STATE',
+      payload: appState,
+    })
+    .catch(() => undefined);
 
   if (appState.currentDrop && appState.isRunning) {
     chrome.action.setBadgeText({ text: `${appState.currentDrop.progress}%` });
@@ -592,49 +603,9 @@ function broadcastStateUpdate() {
   }
 }
 
-function directoryUrl(gameName: string): string {
-  const slug = encodeURIComponent(gameName);
-  return `https://www.twitch.tv/directory/category/${slug}?tl=${DROPS_TAG_ID}`;
-}
-
-function inventoryUrl(): string {
-  return 'https://www.twitch.tv/drops/inventory';
-}
-
 function streamerWatchUrl(channelName: string): string {
   const channel = encodeURIComponent(channelName.toLowerCase());
   return `https://www.twitch.tv/${channel}`;
-}
-
-function clearWorkspaceReferences() {
-  appState.workspaceWindowId = null;
-  appState.tabId = null;
-  appState.activeStreamer = null;
-  appState.directoryTabId = null;
-  appState.dropsTabId = null;
-  appState.inventoryTabId = null;
-}
-
-async function getWorkspaceWindowId(): Promise<number | null> {
-  if (!appState.workspaceWindowId) {
-    return null;
-  }
-  const existing = await chrome.windows.get(appState.workspaceWindowId).catch(() => null);
-  if (existing?.id) {
-    return existing.id;
-  }
-  clearWorkspaceReferences();
-  return null;
-}
-
-async function notifyWorkspaceWindowCreated() {
-  await chrome.notifications.create({
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'DropHunter Workspace',
-    message: 'Opened a dedicated Twitch window for farming tabs.',
-    priority: 1,
-  });
 }
 
 function monitorDashboardUrl(): string {
@@ -645,7 +616,7 @@ async function applyBestEffortAlwaysOnTop(windowId: number) {
   await chrome.windows
     .update(windowId, {
       focused: true,
-      ...( { alwaysOnTop: true } as any ),
+      ...({ alwaysOnTop: true } as any),
     } as any)
     .catch(() => chrome.windows.update(windowId, { focused: true }).catch(() => undefined));
 }
@@ -684,17 +655,9 @@ async function openMonitorDashboardWindow() {
 }
 
 async function createManagedTab(url: string, active = false): Promise<chrome.tabs.Tab | null> {
-  const workspaceWindowId = ENABLE_CONTENT_FALLBACK ? await getWorkspaceWindowId() : null;
-  if (workspaceWindowId) {
-    return chrome.tabs.create({
-      windowId: workspaceWindowId,
-      url,
-      active,
-    }).catch(() => null);
-  }
-
   if (active) {
-    const currentActiveTab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] ?? null;
+    const currentActiveTab =
+      (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] ?? null;
     if (currentActiveTab?.id) {
       const currentUrl = currentActiveTab.url ?? '';
       const canReuseCurrent =
@@ -702,7 +665,9 @@ async function createManagedTab(url: string, active = false): Promise<chrome.tab
         !currentUrl.startsWith('chrome-extension://') &&
         !currentUrl.startsWith('edge://');
       if (canReuseCurrent) {
-        const updated = await chrome.tabs.update(currentActiveTab.id, { url, active: true }).catch(() => null);
+        const updated = await chrome.tabs
+          .update(currentActiveTab.id, { url, active: true })
+          .catch(() => null);
         if (updated?.id) {
           return updated;
         }
@@ -718,7 +683,11 @@ async function createManagedTab(url: string, active = false): Promise<chrome.tab
   return chrome.tabs.create({ url, active }).catch(() => null);
 }
 
-async function ensureManagedTab(existingTabId: number | null, targetUrl: string, active = false): Promise<number | null> {
+async function ensureManagedTab(
+  existingTabId: number | null,
+  targetUrl: string,
+  active = false,
+): Promise<number | null> {
   if (existingTabId) {
     const existingTab = await chrome.tabs.get(existingTabId).catch(() => null);
     if (existingTab?.id) {
@@ -733,110 +702,6 @@ async function ensureManagedTab(existingTabId: number | null, targetUrl: string,
 
   const created = await createManagedTab(targetUrl, active);
   return created?.id ?? null;
-}
-
-async function closeUtilityTabsOutsideWorkspace() {
-  const workspaceWindowId = await getWorkspaceWindowId();
-  if (!workspaceWindowId) {
-    return;
-  }
-
-  const utilityTabs = await chrome.tabs.query({
-    url: [
-      'https://www.twitch.tv/drops/campaigns*',
-      'https://twitch.tv/drops/campaigns*',
-      'https://www.twitch.tv/drops/inventory*',
-      'https://twitch.tv/drops/inventory*',
-      'https://www.twitch.tv/directory/category/*',
-      'https://twitch.tv/directory/category/*',
-    ],
-  });
-
-  const toClose = utilityTabs
-    .filter((tab) => tab.id && tab.windowId !== workspaceWindowId)
-    .map((tab) => tab.id as number);
-  if (toClose.length > 0) {
-    await chrome.tabs.remove(toClose).catch(() => undefined);
-  }
-}
-
-function toSlug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-
-function scoreCategoryMatch(gameName: string, slug: string, label: string): number {
-  const gameSlug = toSlug(gameName);
-  const slugNorm = toSlug(slug);
-  const labelSlug = toSlug(label);
-  let score = 0;
-  if (slugNorm === gameSlug || labelSlug === gameSlug) {
-    score += 100;
-  }
-  if (slugNorm.includes(gameSlug) || gameSlug.includes(slugNorm)) {
-    score += 40;
-  }
-  const gameTokens = new Set(gameSlug.split('-').filter(Boolean));
-  const labelTokens = new Set(labelSlug.split('-').filter(Boolean));
-  gameTokens.forEach((token) => {
-    if (labelTokens.has(token) || slugNorm.includes(token)) {
-      score += 8;
-    }
-  });
-  if (/\d/.test(slugNorm) && /\d/.test(gameSlug) && slugNorm.replace(/\D/g, '') === gameSlug.replace(/\D/g, '')) {
-    score += 12;
-  }
-  return score;
-}
-
-function normalizeToken(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-function scoreDropMatch(base: TwitchDrop, candidate: TwitchDrop): number {
-  // Exact ID match is definitive
-  if (base.id && candidate.id && base.id === candidate.id) {
-    return 1000;
-  }
-  const baseName = normalizeToken(base.name);
-  const candidateName = normalizeToken(candidate.name);
-  const baseGame = normalizeToken(base.gameName);
-  const candidateGame = normalizeToken(candidate.gameName);
-  let score = 0;
-  if (baseName === candidateName) {
-    score += 40;
-  }
-  if (candidateName.includes(baseName) || baseName.includes(candidateName)) {
-    score += 15;
-  }
-  if (baseGame && candidateGame && (baseGame.includes(candidateGame) || candidateGame.includes(baseGame))) {
-    score += 20;
-  }
-  if (base.imageUrl && candidate.imageUrl && base.imageUrl === candidate.imageUrl) {
-    score += 40;
-  }
-  if (base.campaignId && candidate.campaignId && base.campaignId === candidate.campaignId) {
-    score += 30;
-  }
-  return score;
-}
-
-async function ensureDropsTab() {
-  const created = await createManagedTab('https://www.twitch.tv/drops/campaigns', false);
-  appState.dropsTabId = created?.id ?? null;
-  return created?.id ?? null;
-}
-
-async function closeDropsTab(tabId: number) {
-  await chrome.tabs.remove(tabId).catch(() => undefined);
-  if (appState.dropsTabId === tabId) {
-    appState.dropsTabId = null;
-  }
 }
 
 async function ensureContentScriptOnTab(tabId: number) {
@@ -943,14 +808,14 @@ async function recoverTwitchSessionFromCookies(): Promise<TwitchSession | null> 
     return null;
   }
 
-  logInfo('Recovered Twitch session from cookies', sessionDebugSummary(candidate));
+  logDebug('Recovered Twitch session from cookies', sessionDebugSummary(candidate));
   return candidate;
 }
 
 async function recoverTwitchSessionFromStorageKeys(): Promise<TwitchSession | null> {
   const [localAll, syncAll] = await Promise.all([
-    chrome.storage.local.get(null).catch(() => ({} as Record<string, unknown>)),
-    chrome.storage.sync.get(null).catch(() => ({} as Record<string, unknown>)),
+    chrome.storage.local.get(null).catch(() => ({}) as Record<string, unknown>),
+    chrome.storage.sync.get(null).catch(() => ({}) as Record<string, unknown>),
   ]);
 
   const local = localAll as Record<string, unknown>;
@@ -974,12 +839,19 @@ async function recoverTwitchSessionFromStorageKeys(): Promise<TwitchSession | nu
       sync.local_copy_unique_id ??
       local.device_id ??
       sync.device_id,
-    uuid: local.uuid ?? sync.uuid ?? local.clientSessionId ?? sync.clientSessionId ?? local['client-session-id'] ?? sync['client-session-id'],
-    clientIntegrity: local.clientIntegrity ?? sync.clientIntegrity ?? local['client-integrity'] ?? sync['client-integrity'],
+    uuid:
+      local.uuid ??
+      sync.uuid ??
+      local.clientSessionId ??
+      sync.clientSessionId ??
+      local['client-session-id'] ??
+      sync['client-session-id'],
+    clientIntegrity:
+      local.clientIntegrity ?? sync.clientIntegrity ?? local['client-integrity'] ?? sync['client-integrity'],
     clientId: local.clientId ?? sync.clientId,
   });
   if (directCandidate) {
-    logInfo('Recovered Twitch session from flat storage keys', sessionDebugSummary(directCandidate));
+    logDebug('Recovered Twitch session from flat storage keys', sessionDebugSummary(directCandidate));
     return directCandidate;
   }
 
@@ -987,7 +859,7 @@ async function recoverTwitchSessionFromStorageKeys(): Promise<TwitchSession | nu
   for (const [key, value] of allEntries) {
     const session = findSessionCandidateDeep(value);
     if (session) {
-      logInfo('Recovered Twitch session from storage entry', {
+      logDebug('Recovered Twitch session from storage entry', {
         key,
         ...sessionDebugSummary(session),
       });
@@ -1001,7 +873,7 @@ async function recoverTwitchSessionFromStorageKeys(): Promise<TwitchSession | nu
 
 async function refreshTwitchIntegrityToken(session: TwitchSession): Promise<TwitchSession | null> {
   try {
-    logInfo('Refreshing Twitch Client-Integrity token', {
+    logDebug('Refreshing Twitch Client-Integrity token', {
       deviceIdSuffix: session.deviceId ? session.deviceId.slice(-6) : null,
       oauthTokenLength: session.oauthToken ? session.oauthToken.length : 0,
       hasPreviousIntegrity: Boolean(session.clientIntegrity),
@@ -1016,7 +888,7 @@ async function refreshTwitchIntegrityToken(session: TwitchSession): Promise<Twit
     };
     twitchSessionCache = updatedSession;
     await persistTwitchSession(updatedSession);
-    logInfo('Twitch Client-Integrity token refreshed', {
+    logDebug('Twitch Client-Integrity token refreshed', {
       integrityLength: token.length,
       deviceIdSuffix: updatedSession.deviceId ? updatedSession.deviceId.slice(-6) : null,
     });
@@ -1029,13 +901,16 @@ async function refreshTwitchIntegrityToken(session: TwitchSession): Promise<Twit
 
 async function loadPageIntegrityToken(): Promise<string | null> {
   try {
-    const stored = (await chrome.storage.local.get(['twitchIntegrity']).catch(() => ({}))) as Record<string, unknown>;
+    const stored = (await chrome.storage.local.get(['twitchIntegrity']).catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
     const integ = stored.twitchIntegrity as { token?: string; expiration?: number } | undefined;
     if (!integ || typeof integ.token !== 'string' || !integ.token) {
       return null;
     }
     if (typeof integ.expiration === 'number' && integ.expiration > 0 && integ.expiration < Date.now()) {
-      logInfo('Page-intercepted integrity token has expired', { expiration: integ.expiration });
+      logDebug('Page-intercepted integrity token has expired', { expiration: integ.expiration });
       return null;
     }
     return integ.token;
@@ -1052,7 +927,7 @@ async function ensureSessionIntegrity(session: TwitchSession, forceRefresh = fal
   // Prefer the integrity token intercepted from the Twitch page
   const pageToken = await loadPageIntegrityToken();
   if (pageToken && !forceRefresh) {
-    logInfo('Using page-intercepted integrity token', { tokenLength: pageToken.length });
+    logDebug('Using page-intercepted integrity token', { tokenLength: pageToken.length });
     const updated: TwitchSession = { ...session, clientIntegrity: pageToken };
     twitchSessionCache = updated;
     await persistTwitchSession(updated);
@@ -1081,7 +956,13 @@ async function readTwitchSessionViaExecuteScript(tabId: number): Promise<TwitchS
           return match?.[1] ? decodeURIComponent(match[1]) : '';
         };
         const parseTwilight = (): { oauthToken: string; userId: string } => {
-          const keys = ['twilight-user', 'twilight-user-data', 'twilight-user-data-v2', '__twilight-user', 'twilight-session'];
+          const keys = [
+            'twilight-user',
+            'twilight-user-data',
+            'twilight-user-data-v2',
+            '__twilight-user',
+            'twilight-session',
+          ];
           const stores: Storage[] = [window.localStorage, window.sessionStorage];
           for (const store of stores) {
             for (const key of keys) {
@@ -1091,7 +972,10 @@ async function readTwitchSessionViaExecuteScript(tabId: number): Promise<TwitchS
               }
               try {
                 const parsed = JSON.parse(raw) as Record<string, unknown>;
-                const parsedUser = parsed.user && typeof parsed.user === 'object' ? (parsed.user as Record<string, unknown>) : null;
+                const parsedUser =
+                  parsed.user && typeof parsed.user === 'object'
+                    ? (parsed.user as Record<string, unknown>)
+                    : null;
                 const oauthToken =
                   normalizeToken(parsed.authToken) ||
                   normalizeToken(parsed.token) ||
@@ -1115,7 +999,9 @@ async function readTwitchSessionViaExecuteScript(tabId: number): Promise<TwitchS
 
         const twilight = parseTwilight();
         const oauthToken =
-          twilight.oauthToken || normalizeToken(getCookie('auth-token')) || normalizeToken(getCookie('__Secure-auth-token'));
+          twilight.oauthToken ||
+          normalizeToken(getCookie('auth-token')) ||
+          normalizeToken(getCookie('__Secure-auth-token'));
         const userId = twilight.userId || '';
         const deviceId =
           normalize(window.localStorage.getItem('local_copy_unique_id')) ||
@@ -1134,7 +1020,8 @@ async function readTwitchSessionViaExecuteScript(tabId: number): Promise<TwitchS
           normalize(window.sessionStorage.getItem('clientSessionId')) ||
           Math.random().toString(16).slice(2, 10);
         const clientIntegrity =
-          normalize(window.localStorage.getItem('client-integrity')) || normalize(window.localStorage.getItem('clientIntegrity'));
+          normalize(window.localStorage.getItem('client-integrity')) ||
+          normalize(window.localStorage.getItem('clientIntegrity'));
 
         if (!oauthToken || !deviceId) {
           return null;
@@ -1152,7 +1039,7 @@ async function readTwitchSessionViaExecuteScript(tabId: number): Promise<TwitchS
     const raw = execution[0]?.result;
     const session = sanitizeTwitchSession(raw as unknown);
     if (session) {
-      logInfo('Extracted Twitch session via executeScript', { tabId, ...sessionDebugSummary(session) });
+      logDebug('Extracted Twitch session via executeScript', { tabId, ...sessionDebugSummary(session) });
       return session;
     }
     logWarn('executeScript session extraction returned empty payload', { tabId });
@@ -1187,7 +1074,7 @@ async function readTwitchSessionFromTab(tabId: number): Promise<TwitchSession | 
     logWarn('Received invalid Twitch session payload from tab', { tabId });
     return readTwitchSessionViaExecuteScript(tabId);
   }
-  logInfo('Extracted Twitch session from tab', { tabId, ...sessionDebugSummary(session) });
+  logDebug('Extracted Twitch session from tab', { tabId, ...sessionDebugSummary(session) });
   return session;
 }
 
@@ -1196,27 +1083,25 @@ async function findTwitchSessionInOpenTabs(): Promise<TwitchSession | null> {
     url: ['https://www.twitch.tv/*', 'https://twitch.tv/*', 'https://player.twitch.tv/*'],
   });
 
-  const sortedTabs = tabs
-    .slice()
-    .sort((left, right) => {
-      const leftUrl = left.url ?? '';
-      const rightUrl = right.url ?? '';
-      const leftIsMain = leftUrl.includes('://www.twitch.tv/') || leftUrl.includes('://twitch.tv/');
-      const rightIsMain = rightUrl.includes('://www.twitch.tv/') || rightUrl.includes('://twitch.tv/');
-      if (leftIsMain !== rightIsMain) {
-        return leftIsMain ? -1 : 1;
-      }
-      if (Boolean(left.active) !== Boolean(right.active)) {
-        return left.active ? -1 : 1;
-      }
-      return 0;
-    });
+  const sortedTabs = tabs.slice().sort((left, right) => {
+    const leftUrl = left.url ?? '';
+    const rightUrl = right.url ?? '';
+    const leftIsMain = leftUrl.includes('://www.twitch.tv/') || leftUrl.includes('://twitch.tv/');
+    const rightIsMain = rightUrl.includes('://www.twitch.tv/') || rightUrl.includes('://twitch.tv/');
+    if (leftIsMain !== rightIsMain) {
+      return leftIsMain ? -1 : 1;
+    }
+    if (Boolean(left.active) !== Boolean(right.active)) {
+      return left.active ? -1 : 1;
+    }
+    return 0;
+  });
 
   for (const tab of sortedTabs) {
     if (!tab.id) {
       continue;
     }
-    logInfo('Trying Twitch session extraction from tab', {
+    logDebug('Trying Twitch session extraction from tab', {
       tabId: tab.id,
       url: tab.url ?? null,
       active: Boolean(tab.active),
@@ -1229,52 +1114,9 @@ async function findTwitchSessionInOpenTabs(): Promise<TwitchSession | null> {
   return null;
 }
 
-async function fetchTwitchSessionFromHiddenTab(): Promise<TwitchSession | null> {
-  let hiddenWindowId: number | null = null;
-  let tabId: number | null = null;
-
-  const hiddenWindow = await chrome.windows
-    .create({
-      url: 'https://www.twitch.tv/drops/inventory',
-      focused: false,
-      state: 'minimized',
-    })
-    .catch(() => null);
-
-  if (hiddenWindow?.id) {
-    hiddenWindowId = hiddenWindow.id;
-    tabId = hiddenWindow.tabs?.find((tab) => Boolean(tab.id))?.id ?? null;
-  }
-
-  if (!tabId && hiddenWindowId) {
-    const tabs = await chrome.tabs.query({ windowId: hiddenWindowId }).catch(() => []);
-    tabId = tabs.find((tab) => Boolean(tab.id))?.id ?? null;
-  }
-
-  if (!tabId) {
-    if (hiddenWindowId) {
-      await chrome.windows.remove(hiddenWindowId).catch(() => undefined);
-    }
-    return null;
-  }
-
-  try {
-    await waitForTabComplete(tabId, 15_000);
-    await ensureContentScriptOnTab(tabId);
-    await new Promise((resolve) => setTimeout(resolve, 900));
-    return await readTwitchSessionFromTab(tabId).catch(() => null);
-  } finally {
-    if (hiddenWindowId) {
-      await chrome.windows.remove(hiddenWindowId).catch(() => undefined);
-    } else {
-      await chrome.tabs.remove(tabId).catch(() => undefined);
-    }
-  }
-}
-
 async function ensureTwitchSession(forceRefresh = false): Promise<TwitchSession | null> {
   if (!forceRefresh && twitchSessionCache) {
-    logInfo('Using cached Twitch session', sessionDebugSummary(twitchSessionCache));
+    logDebug('Using cached Twitch session', sessionDebugSummary(twitchSessionCache));
     return twitchSessionCache;
   }
 
@@ -1291,13 +1133,15 @@ async function ensureTwitchSession(forceRefresh = false): Promise<TwitchSession 
   twitchSessionFetchInFlight = (async () => {
     twitchSessionLastAttemptAt = Date.now();
     if (!forceRefresh) {
-      const storageResult = (await chrome.storage.local.get([TWITCH_SESSION_STORAGE_KEY]).catch(() => ({}))) as Record<string, unknown>;
+      const storageResult = (await chrome.storage.local
+        .get([TWITCH_SESSION_STORAGE_KEY])
+        .catch(() => ({}))) as Record<string, unknown>;
       const fromStorageRaw = storageResult[TWITCH_SESSION_STORAGE_KEY];
       const fromStorage = sanitizeTwitchSession(fromStorageRaw as unknown);
       if (fromStorage) {
         twitchSessionCache = fromStorage;
         logInfo('Twitch session restored from storage');
-        logInfo('Session details', sessionDebugSummary(fromStorage));
+        logDebug('Session details', sessionDebugSummary(fromStorage));
         return fromStorage;
       }
 
@@ -1307,7 +1151,7 @@ async function ensureTwitchSession(forceRefresh = false): Promise<TwitchSession 
         await persistTwitchSession(recoveredSession);
         twitchSessionLastAttemptAt = Date.now();
         logInfo('Twitch session restored from legacy storage keys');
-        logInfo('Session details', sessionDebugSummary(recoveredSession));
+        logDebug('Session details', sessionDebugSummary(recoveredSession));
         return recoveredSession;
       }
     }
@@ -1318,7 +1162,7 @@ async function ensureTwitchSession(forceRefresh = false): Promise<TwitchSession 
       await persistTwitchSession(fromCookies);
       twitchSessionLastAttemptAt = Date.now();
       logInfo('Twitch session restored from cookies');
-      logInfo('Session details', sessionDebugSummary(fromCookies));
+      logDebug('Session details', sessionDebugSummary(fromCookies));
       return fromCookies;
     }
 
@@ -1328,20 +1172,8 @@ async function ensureTwitchSession(forceRefresh = false): Promise<TwitchSession 
       await persistTwitchSession(fromOpenTabs);
       twitchSessionLastAttemptAt = Date.now();
       logInfo('Twitch session extracted from open Twitch tab');
-      logInfo('Session details', sessionDebugSummary(fromOpenTabs));
+      logDebug('Session details', sessionDebugSummary(fromOpenTabs));
       return fromOpenTabs;
-    }
-
-    if (ENABLE_CONTENT_FALLBACK) {
-      const fromHidden = await fetchTwitchSessionFromHiddenTab();
-      if (fromHidden) {
-        twitchSessionCache = fromHidden;
-        await persistTwitchSession(fromHidden);
-        twitchSessionLastAttemptAt = Date.now();
-        logInfo('Twitch session extracted from hidden tab');
-        logInfo('Session details', sessionDebugSummary(fromHidden));
-        return fromHidden;
-      }
     }
 
     clearTwitchSessionCache();
@@ -1379,13 +1211,13 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
     }
   }
 
-  logInfo('Fetching drops snapshot via API', {
+  logDebug('Fetching drops snapshot via API', {
     forceSessionRefresh,
     ...sessionDebugSummary(session),
   });
 
   const sessionWithIntegrity = await ensureSessionIntegrity(session);
-  logInfo('Attempting Twitch drops snapshot request', {
+  logDebug('Attempting Twitch drops snapshot request', {
     mode: sessionWithIntegrity.clientIntegrity ? 'primary-with-integrity' : 'primary-no-integrity',
     hasIntegrity: Boolean(sessionWithIntegrity.clientIntegrity),
     oauthTokenLength: sessionWithIntegrity.oauthToken?.length ?? 0,
@@ -1398,7 +1230,7 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
       logWarn('Drops snapshot API returned empty payload');
       return null;
     }
-    logInfo('Drops snapshot API success', {
+    logDebug('Drops snapshot API success', {
       games: snapshot.games.length,
       drops: snapshot.drops.length,
     });
@@ -1408,12 +1240,17 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
     if (message.includes('integrity')) {
       // Retry 1: refresh integrity token and retry
       const refreshedIntegritySession = await ensureSessionIntegrity(session, true);
-      if (refreshedIntegritySession.clientIntegrity && refreshedIntegritySession.clientIntegrity !== sessionWithIntegrity.clientIntegrity) {
-        logInfo('Attempting Twitch drops snapshot request', {
+      if (
+        refreshedIntegritySession.clientIntegrity &&
+        refreshedIntegritySession.clientIntegrity !== sessionWithIntegrity.clientIntegrity
+      ) {
+        logDebug('Attempting Twitch drops snapshot request', {
           mode: 'retry-refreshed-integrity',
           hasIntegrity: true,
           oauthTokenLength: refreshedIntegritySession.oauthToken?.length ?? 0,
-          deviceIdSuffix: refreshedIntegritySession.deviceId ? refreshedIntegritySession.deviceId.slice(-6) : null,
+          deviceIdSuffix: refreshedIntegritySession.deviceId
+            ? refreshedIntegritySession.deviceId.slice(-6)
+            : null,
         });
         try {
           client = new TwitchApiClient(refreshedIntegritySession);
@@ -1429,7 +1266,7 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
       }
 
       // Retry 2: strip integrity and try without it
-      logInfo('Attempting Twitch drops snapshot request', {
+      logDebug('Attempting Twitch drops snapshot request', {
         mode: 'retry-without-integrity',
         hasIntegrity: false,
         oauthTokenLength: session.oauthToken?.length ?? 0,
@@ -1459,7 +1296,10 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
   }
 }
 
-async function fetchDirectoryStreamersFromApi(game: TwitchGame, forceSessionRefresh = false): Promise<TwitchStreamer[]> {
+async function fetchDirectoryStreamersFromApi(
+  game: TwitchGame,
+  forceSessionRefresh = false,
+): Promise<TwitchStreamer[]> {
   const session = await ensureTwitchSession(forceSessionRefresh);
   if (!session) {
     logWarn('Directory streamers fetch: session missing, using public client');
@@ -1475,9 +1315,9 @@ async function fetchDirectoryStreamersFromApi(game: TwitchGame, forceSessionRefr
   );
   try {
     const slug = game.categorySlug ?? toSlug(game.name);
-    logInfo('Directory streamers fetching', { game: game.name, slug });
+    logDebug('Directory streamers fetching', { game: game.name, slug });
     const streamers = await client.fetchDirectoryStreamers(game.name, slug);
-    logInfo('Directory streamers fetched', {
+    logDebug('Directory streamers fetched', {
       game: game.name,
       slug,
       count: streamers.length,
@@ -1495,48 +1335,6 @@ async function fetchDirectoryStreamersFromApi(game: TwitchGame, forceSessionRefr
   }
 }
 
-async function fetchDropsSnapshot(selectedGameName = appState.selectedGame?.name ?? ''): Promise<DropsSnapshot | null> {
-  const tabId = await ensureDropsTab();
-  if (!tabId) {
-    return null;
-  }
-
-  const send = async () =>
-    chrome.tabs.sendMessage(tabId, {
-      type: 'FETCH_DROPS_DATA',
-      payload: { selectedGameName },
-    });
-  try {
-    await waitForTabComplete(tabId, 12_000);
-    await ensureContentScriptOnTab(tabId);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-
-    let response: any;
-    try {
-      response = await send();
-    } catch {
-      await ensureContentScriptOnTab(tabId);
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      response = await send().catch(() => null);
-      if (!response) {
-        await chrome.tabs.reload(tabId).catch(() => undefined);
-        await waitForTabComplete(tabId, 12_000);
-        await ensureContentScriptOnTab(tabId);
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-        response = await send().catch(() => null);
-      }
-    }
-
-    if (!response?.success || !response.snapshot) {
-      return null;
-    }
-
-    return response.snapshot as DropsSnapshot;
-  } finally {
-    await closeDropsTab(tabId);
-  }
-}
-
 async function fetchStreamContext(tabId: number): Promise<StreamContext | null> {
   const send = async () => chrome.tabs.sendMessage(tabId, { type: 'GET_STREAM_CONTEXT' });
   let response: any;
@@ -1550,33 +1348,6 @@ async function fetchStreamContext(tabId: number): Promise<StreamContext | null> 
     return null;
   }
   return response.context as StreamContext;
-}
-
-async function ensureInventoryTab(): Promise<number | null> {
-  const targetUrl = inventoryUrl();
-  const existingManaged = await ensureManagedTab(appState.inventoryTabId, targetUrl, false);
-  if (existingManaged) {
-    appState.inventoryTabId = existingManaged;
-    return existingManaged;
-  }
-
-  const workspaceWindowId = await getWorkspaceWindowId();
-  const queryBase = workspaceWindowId ? { windowId: workspaceWindowId } : {};
-  const tabs = await chrome.tabs.query({
-    ...queryBase,
-    url: ['https://www.twitch.tv/drops/inventory*', 'https://twitch.tv/drops/inventory*'],
-  });
-  if (tabs[0]?.id) {
-    appState.inventoryTabId = tabs[0].id;
-    if (tabs[0].url !== targetUrl) {
-      await chrome.tabs.update(tabs[0].id, { url: targetUrl, active: false }).catch(() => undefined);
-    }
-    return tabs[0].id;
-  }
-
-  const created = await createManagedTab(targetUrl, false);
-  appState.inventoryTabId = created?.id ?? null;
-  return created?.id ?? null;
 }
 
 async function waitForTabComplete(tabId: number, timeoutMs = 12_000): Promise<void> {
@@ -1600,69 +1371,15 @@ async function waitForTabComplete(tabId: number, timeoutMs = 12_000): Promise<vo
 
     const timer = setTimeout(finish, timeoutMs);
     chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.get(tabId).then((tab) => {
-      if (tab.status === 'complete') {
-        finish();
-      }
-    }).catch(() => finish());
+    chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (tab.status === 'complete') {
+          finish();
+        }
+      })
+      .catch(() => finish());
   });
-}
-
-async function fetchGamesFromHiddenDropsTab(): Promise<TwitchGame[]> {
-  let hiddenWindowId: number | null = null;
-  let tabId: number | null = null;
-  const hiddenWindow = await chrome.windows
-    .create({
-      url: 'https://www.twitch.tv/drops/campaigns',
-      focused: false,
-      state: 'minimized',
-    })
-    .catch(() => null);
-
-  if (hiddenWindow?.id) {
-    hiddenWindowId = hiddenWindow.id;
-    tabId = hiddenWindow.tabs?.find((tab) => Boolean(tab.id))?.id ?? null;
-  }
-
-  if (!tabId && hiddenWindowId) {
-    const tabs = await chrome.tabs.query({ windowId: hiddenWindowId }).catch(() => []);
-    tabId = tabs.find((tab) => Boolean(tab.id))?.id ?? null;
-  }
-
-  if (!tabId) {
-    if (hiddenWindowId) {
-      await chrome.windows.remove(hiddenWindowId).catch(() => undefined);
-    }
-    return [];
-  }
-
-  const send = async () => chrome.tabs.sendMessage(tabId as number, { type: 'FETCH_GAMES' });
-  try {
-    await waitForTabComplete(tabId, 15_000);
-    await ensureContentScriptOnTab(tabId);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-
-    let response: any = await send().catch(() => null);
-    if (!response?.success) {
-      await ensureContentScriptOnTab(tabId);
-      response = await send().catch(() => null);
-    }
-    if (!response?.success) {
-      await chrome.tabs.reload(tabId).catch(() => undefined);
-      await waitForTabComplete(tabId, 12_000);
-      await ensureContentScriptOnTab(tabId);
-      await new Promise((resolve) => setTimeout(resolve, 900));
-      response = await send().catch(() => null);
-    }
-
-    return response?.success && Array.isArray(response.games) ? (response.games as TwitchGame[]) : [];
-  } finally {
-    if (hiddenWindowId) {
-      await chrome.windows.remove(hiddenWindowId).catch(() => undefined);
-    } else {
-      await chrome.tabs.remove(tabId).catch(() => undefined);
-    }
-  }
 }
 
 async function refreshGamesCacheFromHiddenFetch(): Promise<TwitchGame[]> {
@@ -1681,14 +1398,17 @@ async function refreshGamesCacheFromHiddenFetch(): Promise<TwitchGame[]> {
       if (apiSnapshot.campaignChannelsMap) {
         cachedCampaignChannelsMap = apiSnapshot.campaignChannelsMap;
       }
-    } else if (ENABLE_CONTENT_FALLBACK) {
-      fetchedGames = await fetchGamesFromHiddenDropsTab();
     }
 
     const mergedGames = mergeAvailableGames(appState.availableGames, fetchedGames);
     appState.availableGames = mergedGames;
     normalizeGameSelection(mergedGames);
     normalizeQueueSelection(mergedGames);
+    // If we have a selected game and fresh drops, update the drop split
+    if (appState.selectedGame && cachedDropsSnapshot.length > 0) {
+      splitDropsForSelectedGame(cachedDropsSnapshot);
+    }
+    lastGamesCacheRefreshAt = Date.now();
     await saveState();
     return mergedGames;
   })().finally(() => {
@@ -1698,130 +1418,12 @@ async function refreshGamesCacheFromHiddenFetch(): Promise<TwitchGame[]> {
   return gamesCacheRefreshInFlight;
 }
 
-async function refreshInventoryTabForFreshData(tabId: number) {
-  const inventoryTab = await chrome.tabs.get(tabId).catch(() => null);
-  const inventoryWasActive = Boolean(inventoryTab?.active);
-  await chrome.tabs.reload(tabId).catch(() => undefined);
-  await waitForTabComplete(tabId, 10_000);
-  await ensureContentScriptOnTab(tabId);
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  if (inventoryWasActive && appState.tabId) {
-    await chrome.tabs.update(appState.tabId, { active: true }).catch(() => undefined);
-  }
-}
-
-async function fetchInventoryDrops(selectedGameName: string, selectedGameImage?: string): Promise<TwitchDrop[]> {
-  const tabId = await ensureInventoryTab();
-  if (!tabId) {
-    return [];
-  }
-
-  const send = async () =>
-    chrome.tabs.sendMessage(tabId, {
-      type: 'FETCH_INVENTORY_DATA',
-      payload: { selectedGameName, selectedGameImage: selectedGameImage ?? '' },
-    });
-
-  const readDropsWithRetry = async (attempts: number, waitMs: number): Promise<TwitchDrop[]> => {
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const response: any = await send().catch(() => null);
-      if (response?.success && Array.isArray(response.drops)) {
-        const drops = response.drops as TwitchDrop[];
-        if (drops.length > 0) {
-          return drops;
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-    }
-    return [];
-  };
-
-  try {
-    await refreshInventoryTabForFreshData(tabId);
-    const freshDrops = await readDropsWithRetry(6, 1000);
-    if (freshDrops.length > 0) {
-      return freshDrops;
-    }
-  } catch {
-    await ensureContentScriptOnTab(tabId);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    const recoveryDrops = await readDropsWithRetry(3, 1200);
-    if (recoveryDrops.length > 0) {
-      return recoveryDrops;
-    }
-  }
-
-  return [];
-}
-
-function mergeDropsWithInventory(campaignDrops: TwitchDrop[], inventoryDrops: TwitchDrop[]): TwitchDrop[] {
-  if (inventoryDrops.length === 0) {
-    return campaignDrops;
-  }
-
-  // Track which inventory drops have been consumed so each is matched at most once
-  const consumedInventory = new Set<number>();
-
-  const merged = campaignDrops.map((drop) => {
-    const scored = inventoryDrops
-      .map((candidate, idx) => ({ candidate, idx, score: consumedInventory.has(idx) ? -1 : scoreDropMatch(drop, candidate) }))
-      .sort((a, b) => b.score - a.score)[0];
-
-    if (!scored || scored.score < 70) {
-      return drop;
-    }
-
-    // Consume this inventory drop so it can't match another campaign drop
-    consumedInventory.add(scored.idx);
-
-    const inventoryDrop = scored.candidate;
-    const mergedProgress = inventoryDrop.progressSource === 'inventory' ? inventoryDrop.progress : Math.max(drop.progress, inventoryDrop.progress);
-    const mergedClaimed = drop.claimed || inventoryDrop.claimed;
-    const mergedClaimable = Boolean(drop.claimable) || Boolean(inventoryDrop.claimable);
-    const mergedRequiredMinutes = inventoryDrop.requiredMinutes ?? drop.requiredMinutes ?? null;
-    const mergedRemainingMinutes =
-      inventoryDrop.remainingMinutes ??
-      (typeof mergedRequiredMinutes === 'number' && Number.isFinite(mergedRequiredMinutes)
-        ? Math.max(0, Math.round((mergedRequiredMinutes * (100 - mergedProgress)) / 100))
-        : drop.remainingMinutes ?? null);
-
-    return {
-      ...drop,
-      progress: mergedProgress,
-      claimed: mergedClaimed,
-      claimable: mergedClaimable,
-      imageUrl: drop.imageUrl || inventoryDrop.imageUrl,
-      campaignId: drop.campaignId || inventoryDrop.campaignId,
-      requiredMinutes: mergedRequiredMinutes,
-      remainingMinutes: mergedRemainingMinutes,
-      progressSource: inventoryDrop.progressSource ?? drop.progressSource,
-      status: (mergedClaimed ? 'completed' : mergedClaimable ? 'pending' : mergedProgress > 0 ? 'active' : 'pending') as DropStatus,
-    };
-  });
-
-  // Include drop.id in dedup key so same-named drops aren't filtered out
-  const mergedKeys = new Set(merged.map((drop) => `${drop.id}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`));
-  const selectedGameName = normalizeToken(appState.selectedGame?.name ?? '');
-  const extras = inventoryDrops.filter((drop, idx) => {
-    // Already consumed by a campaign drop merge
-    if (consumedInventory.has(idx)) {
-      return false;
-    }
-    const key = `${drop.id}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
-    if (mergedKeys.has(key)) {
-      return false;
-    }
-    if (!drop.claimed) {
-      return true;
-    }
-    return Boolean(selectedGameName && normalizeToken(drop.gameName) === selectedGameName);
-  });
-
-  return [...merged, ...extras];
-}
-
 function isSameGame(left: TwitchGame, right: TwitchGame): boolean {
-  return left.id === right.id || sameCampaignId(left.campaignId, right.campaignId) || gameKey(left) === gameKey(right);
+  return (
+    left.id === right.id ||
+    sameCampaignId(left.campaignId, right.campaignId) ||
+    gameKey(left) === gameKey(right)
+  );
 }
 
 function queueContainsGame(game: TwitchGame): boolean {
@@ -1836,7 +1438,7 @@ function resolveGameFromState(game: TwitchGame): TwitchGame {
   const resolved = findMatchingGame(game, appState.availableGames);
   if (resolved) {
     if (resolved.id !== game.id || resolved.campaignId !== game.campaignId) {
-      logInfo('Resolved selected game to canonical campaign', {
+      logDebug('Resolved selected game to canonical campaign', {
         inputId: game.id,
         inputCampaignId: game.campaignId ?? null,
         inputName: game.name,
@@ -1848,10 +1450,12 @@ function resolveGameFromState(game: TwitchGame): TwitchGame {
     return resolved;
   }
 
-  const byNameCandidates = appState.availableGames.filter((candidate) => normalizeToken(candidate.name) === normalizeToken(game.name));
+  const byNameCandidates = appState.availableGames.filter(
+    (candidate) => normalizeToken(candidate.name) === normalizeToken(game.name),
+  );
   const byNamePreferred = choosePreferredGame(byNameCandidates);
   if (byNamePreferred) {
-    logInfo('Resolved selected game by exact name fallback', {
+    logDebug('Resolved selected game by exact name fallback', {
       inputId: game.id,
       inputCampaignId: game.campaignId ?? null,
       resolvedId: byNamePreferred.id,
@@ -1864,7 +1468,10 @@ function resolveGameFromState(game: TwitchGame): TwitchGame {
   return game;
 }
 
-function evaluateDropsForGame(game: TwitchGame, drops: TwitchDrop[]): { allDrops: TwitchDrop[]; pendingDrops: TwitchDrop[] } {
+function evaluateDropsForGame(
+  game: TwitchGame,
+  drops: TwitchDrop[],
+): { allDrops: TwitchDrop[]; pendingDrops: TwitchDrop[] } {
   const relevantDrops = drops.filter((drop) => dropMatchesSelectedGame(drop, game));
   const allDrops = relevantDrops;
   const pendingDrops = allDrops.filter((drop) => !isDropCompleted(drop));
@@ -1880,60 +1487,21 @@ async function inspectGameProgress(game: TwitchGame): Promise<{
   const snapshot = await fetchDropsSnapshotFromApi();
   if (snapshot?.games?.length) {
     appState.availableGames = mergeAvailableGames(appState.availableGames, snapshot.games);
+    normalizeGameSelection(appState.availableGames);
     normalizeQueueSelection(appState.availableGames);
+    // Update cached drops if API returned them
+    if (snapshot.drops.length > 0) {
+      cachedDropsSnapshot = snapshot.drops;
+    }
   }
 
   const resolvedGame = resolveGameFromState(initialGame);
-  const candidateDrops = snapshot?.drops ?? cachedDropsSnapshot;
+  const candidateDrops = snapshot?.drops?.length ? snapshot.drops : cachedDropsSnapshot;
 
   return {
     resolvedGame,
     ...evaluateDropsForGame(resolvedGame, candidateDrops),
   };
-}
-
-async function openDirectoryTab(categorySlug: string): Promise<number | null> {
-  const created = await createManagedTab(directoryUrl(categorySlug), false);
-  appState.directoryTabId = created?.id ?? null;
-  return created?.id ?? null;
-}
-
-async function closeDirectoryTab(tabId: number) {
-  await chrome.tabs.remove(tabId).catch(() => undefined);
-  if (appState.directoryTabId === tabId) {
-    appState.directoryTabId = null;
-  }
-}
-
-async function fetchDirectoryStreamers(categorySlug: string): Promise<TwitchStreamer[]> {
-  const tabId = await openDirectoryTab(categorySlug);
-  if (!tabId) {
-    return [];
-  }
-
-  try {
-    const send = async () => chrome.tabs.sendMessage(tabId, { type: 'GET_DIRECTORY_STREAMERS' });
-    await waitForTabComplete(tabId, 12_000);
-    await ensureContentScriptOnTab(tabId);
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-
-    let response: any = await send().catch(() => null);
-    if (!response?.success) {
-      await ensureContentScriptOnTab(tabId);
-      response = await send().catch(() => null);
-    }
-    if (!response?.success) {
-      await chrome.tabs.reload(tabId).catch(() => undefined);
-      await waitForTabComplete(tabId, 10_000);
-      await ensureContentScriptOnTab(tabId);
-      await new Promise((resolve) => setTimeout(resolve, 900));
-      response = await send().catch(() => null);
-    }
-
-    return response?.success ? (response.streamers as TwitchStreamer[]) : [];
-  } finally {
-    await closeDirectoryTab(tabId);
-  }
 }
 
 async function focusTabWindow(tabId: number) {
@@ -1944,27 +1512,10 @@ async function focusTabWindow(tabId: number) {
   await chrome.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
 }
 
-async function fetchCategorySuggestions(gameName: string): Promise<Array<{ slug: string; label: string }>> {
-  const tab = await createManagedTab(`https://www.twitch.tv/search?term=${encodeURIComponent(gameName)}`, false);
-  if (!tab?.id) {
-    return [];
-  }
-
-  await waitForTabComplete(tab.id, 12_000);
-  await ensureContentScriptOnTab(tab.id);
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-  const response = await chrome.tabs.sendMessage(tab.id, { type: 'GET_CATEGORY_SUGGESTIONS' }).catch(() => null);
-  await chrome.tabs.remove(tab.id).catch(() => undefined);
-  if (!response?.success || !Array.isArray(response.categories)) {
-    return [];
-  }
-  return response.categories as Array<{ slug: string; label: string }>;
-}
-
 async function resolveCategorySlug(game: TwitchGame): Promise<string> {
   // Prefer availableGames — may have the correct slug from content script
   const updated = appState.availableGames.find(
-    (item) => item.id === game.id || sameCampaignId(item.campaignId, game.campaignId)
+    (item) => item.id === game.id || sameCampaignId(item.campaignId, game.campaignId),
   );
   if (updated?.categorySlug) {
     return updated.categorySlug;
@@ -2085,11 +1636,13 @@ async function sendAlert(kind: 'drop-complete' | 'all-complete', message: string
     tabs
       .filter((tab) => Boolean(tab.id))
       .map((tab) =>
-        chrome.tabs.sendMessage(tab.id as number, {
-          type: 'PLAY_ALERT',
-          payload: { kind, message },
-        }).catch(() => undefined)
-      )
+        chrome.tabs
+          .sendMessage(tab.id as number, {
+            type: 'PLAY_ALERT',
+            payload: { kind, message },
+          })
+          .catch(() => undefined),
+      ),
   );
 }
 
@@ -2104,7 +1657,10 @@ async function evaluateDropTransitions(previousCompletedIds: Set<string>) {
   const hasDrops = appState.allDrops.length > 0;
   const allCompleted = hasDrops && appState.pendingDrops.length === 0 && appState.currentDrop === null;
   if (allCompleted && !appState.completionNotified) {
-    await sendAlert('all-complete', `All rewards for ${appState.selectedGame?.name ?? 'this campaign'} are complete.`);
+    await sendAlert(
+      'all-complete',
+      `All rewards for ${appState.selectedGame?.name ?? 'this campaign'} are complete.`,
+    );
     appState.completionNotified = true;
   }
 
@@ -2151,7 +1707,7 @@ async function claimDropViaApi(drop: TwitchDrop): Promise<boolean> {
   }
 
   if (!canRetryDropClaim(claimId)) {
-    logInfo('Auto-claim cooldown active', { claimId, dropName: drop.name });
+    logDebug('Auto-claim cooldown active', { claimId, dropName: drop.name });
     return false;
   }
 
@@ -2167,7 +1723,7 @@ async function claimDropViaApi(drop: TwitchDrop): Promise<boolean> {
   };
 
   try {
-    logInfo('Auto-claim attempt', { claimId, dropName: drop.name, game: drop.gameName });
+    logDebug('Auto-claim attempt', { claimId, dropName: drop.name, game: drop.gameName });
     const claimed = await tryClaim(false);
     if (!claimed) {
       dropClaimRetryAtById.set(claimId, Date.now() + DROP_CLAIM_RETRY_COOLDOWN_MS);
@@ -2202,6 +1758,14 @@ async function claimDropViaApi(drop: TwitchDrop): Promise<boolean> {
 async function autoClaimClaimableDrops(): Promise<boolean> {
   if (dropClaimInFlight) {
     return false;
+  }
+
+  // Prune expired retry cooldowns
+  const now = Date.now();
+  for (const [id, retryAt] of dropClaimRetryAtById) {
+    if (now >= retryAt) {
+      dropClaimRetryAtById.delete(id);
+    }
   }
 
   const claimTargets = appState.pendingDrops
@@ -2249,7 +1813,11 @@ async function refreshDropsData(options: RefreshDropsOptions = {}) {
   const forceInventoryFetch = options.forceInventoryFetch ?? false;
   const previousCompletedIds = new Set(appState.completedDrops.map((drop) => drop.id));
   let games = appState.availableGames;
-  let drops = includeCampaignFetch ? (cachedDropsSnapshot.length > 0 ? cachedDropsSnapshot : appState.allDrops) : appState.allDrops;
+  let drops = includeCampaignFetch
+    ? cachedDropsSnapshot.length > 0
+      ? cachedDropsSnapshot
+      : appState.allDrops
+    : appState.allDrops;
   let apiSnapshotUsed = false;
   const selectedGame = appState.selectedGame;
   logInfo('Starting drops refresh', {
@@ -2268,33 +1836,18 @@ async function refreshDropsData(options: RefreshDropsOptions = {}) {
       drops = apiSnapshot.drops;
       if (apiSnapshot.drops.length > 0) {
         cachedDropsSnapshot = apiSnapshot.drops;
+      } else if (cachedDropsSnapshot.length > 0) {
+        // API returned games but no drops (e.g. campaign details fetch failed) — use cached drops
+        logWarn('API returned games but 0 drops — falling back to cached drops', {
+          apiGames: apiSnapshot.games.length,
+          cachedDrops: cachedDropsSnapshot.length,
+        });
+        drops = cachedDropsSnapshot;
       }
       if (apiSnapshot.campaignChannelsMap) {
         cachedCampaignChannelsMap = apiSnapshot.campaignChannelsMap;
       }
       apiSnapshotUsed = true;
-    }
-  }
-
-  if (ENABLE_CONTENT_FALLBACK && includeCampaignFetch && !apiSnapshotUsed) {
-    const snapshot = await fetchDropsSnapshot();
-    if (snapshot) {
-      games = mergeAvailableGames(appState.availableGames, snapshot.games);
-      drops = snapshot.drops;
-    }
-  }
-
-  const shouldFetchInventory =
-    ENABLE_CONTENT_FALLBACK &&
-    includeInventoryFetch &&
-    selectedGame?.name &&
-    (!appState.isRunning || forceInventoryFetch || Date.now() - lastInventoryRefreshAt >= INVENTORY_REFRESH_INTERVAL_MS);
-  if (shouldFetchInventory && selectedGame) {
-    const inventoryDrops = await fetchInventoryDrops(selectedGame.name, selectedGame.imageUrl);
-    lastInventoryRefreshAt = Date.now();
-    if (inventoryDrops.length > 0) {
-      const baseDrops = drops.length > 0 ? drops : appState.allDrops;
-      drops = mergeDropsWithInventory(baseDrops, inventoryDrops);
     }
   }
 
@@ -2307,6 +1860,16 @@ async function refreshDropsData(options: RefreshDropsOptions = {}) {
       cachedDrops: cachedDropsSnapshot.length,
       selectedGame: selectedGame?.name ?? null,
     });
+    drops = cachedDropsSnapshot;
+  }
+
+  // Final safety net: never overwrite working state with empty drops
+  if (drops.length === 0 && appState.allDrops.length > 0) {
+    logWarn('All drop sources empty — preserving current state to prevent corruption', {
+      currentAllDrops: appState.allDrops.length,
+      cachedDrops: cachedDropsSnapshot.length,
+    });
+    drops = appState.allDrops;
   }
 
   updateStateFromSnapshot({
@@ -2314,7 +1877,7 @@ async function refreshDropsData(options: RefreshDropsOptions = {}) {
     drops,
     updatedAt: Date.now(),
   });
-  logInfo('Drops data refresh', {
+  logDebug('Drops data refresh', {
     includeCampaignFetch,
     includeInventoryFetch,
     forceInventoryFetch,
@@ -2347,32 +1910,38 @@ async function checkDropProgress() {
     }
     await enforcePlaybackPolicyOnStreamTab();
     await rotateStreamerIfInvalid();
-    await refreshDropsData();
+
+    const isFullTick = Date.now() - lastFullRefreshAt >= FULL_REFRESH_INTERVAL_MS;
+    if (isFullTick) {
+      await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
+      lastFullRefreshAt = Date.now();
+    } else {
+      await refreshDropsData();
+    }
+
     const claimedAny = await autoClaimClaimableDrops();
     if (claimedAny) {
-      await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true, forceInventoryFetch: true });
+      await refreshDropsData({
+        includeCampaignFetch: true,
+        includeInventoryFetch: true,
+        forceInventoryFetch: true,
+      });
+      lastFullRefreshAt = Date.now();
     }
     await advanceQueueIfCompleted();
   } finally {
     monitorTickInFlight = false;
+    await saveTimingState();
   }
 }
 
 function startMonitoring() {
-  if (monitoringInterval) {
-    clearInterval(monitoringInterval);
-  }
-  monitoringInterval = setInterval(() => {
-    checkDropProgress().catch((error) => logWarn('Monitoring error:', String(error)));
-  }, PROGRESS_POLL_MS);
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: PROGRESS_POLL_MS / 60_000 });
   checkDropProgress().catch((error) => logWarn('Initial monitoring error:', String(error)));
 }
 
 function stopMonitoring() {
-  if (monitoringInterval) {
-    clearInterval(monitoringInterval);
-    monitoringInterval = null;
-  }
+  chrome.alarms.clear(ALARM_NAME).catch(() => undefined);
 }
 
 async function openBestStreamerForSelectedGame(): Promise<boolean> {
@@ -2383,7 +1952,7 @@ async function openBestStreamerForSelectedGame(): Promise<boolean> {
 
   // Fix 3: Pre-farming guard — skip streamer search if all drops for this game are completed
   const dropsForGame = cachedDropsSnapshot.filter((drop) =>
-    dropMatchesSelectedGame(drop, appState.selectedGame!)
+    dropMatchesSelectedGame(drop, appState.selectedGame!),
   );
   if (dropsForGame.length > 0 && dropsForGame.every((d) => isDropCompleted(d))) {
     logInfo('Skipping streamer: all drops completed', { game: appState.selectedGame.name });
@@ -2401,7 +1970,7 @@ async function openBestStreamerForSelectedGame(): Promise<boolean> {
   // Fix 2c: Per-campaign channel filtering — only use allowedChannels from PENDING campaigns
   const pendingDropsForGame = dropsForGame.filter((d) => !isDropCompleted(d));
   const pendingCampaignIds = new Set(
-    pendingDropsForGame.map((d) => d.campaignId).filter((id): id is string => Boolean(id))
+    pendingDropsForGame.map((d) => d.campaignId).filter((id): id is string => Boolean(id)),
   );
   let allowed: string[] | null = null;
   let hasUnrestrictedCampaign = false;
@@ -2422,18 +1991,19 @@ async function openBestStreamerForSelectedGame(): Promise<boolean> {
     allowed = appState.selectedGame.allowedChannels ?? null;
   }
 
-  logInfo('Streamer selection debug', {
+  logDebug('Streamer selection debug', {
     game: appState.selectedGame.name,
     pendingCampaignIds: Array.from(pendingCampaignIds),
     allowedChannels: allowed ?? 'null (any channel)',
     directoryStreamers: streamers.map((s) => s.name),
     directoryCount: streamers.length,
   });
-  const candidates = (allowed != null && allowed.length > 0)
-    ? streamers.filter((s) => allowed!.includes(s.name.toLowerCase()))
-    : streamers;
+  const candidates =
+    allowed != null && allowed.length > 0
+      ? streamers.filter((s) => allowed!.includes(s.name.toLowerCase()))
+      : streamers;
   if (allowed != null && allowed.length > 0) {
-    logInfo('Filtered streamers by allowedChannels', {
+    logDebug('Filtered streamers by allowedChannels', {
       game: appState.selectedGame.name,
       beforeFilter: streamers.length,
       afterFilter: candidates.length,
@@ -2441,7 +2011,9 @@ async function openBestStreamerForSelectedGame(): Promise<boolean> {
       rejected: streamers.filter((s) => !allowed!.includes(s.name.toLowerCase())).map((s) => s.name),
     });
   }
-  const streamer = candidates.find((item) => item.viewerCount !== undefined && item.viewerCount < Number.MAX_SAFE_INTEGER) ?? candidates[0];
+  const streamer =
+    candidates.find((item) => item.viewerCount !== undefined && item.viewerCount < Number.MAX_SAFE_INTEGER) ??
+    candidates[0];
   if (streamer) {
     logInfo('Opening selected streamer', {
       game: appState.selectedGame.name,
@@ -2462,7 +2034,7 @@ async function openBestStreamerForSelectedGame(): Promise<boolean> {
   return false;
 }
 
-async function ensureWorkspaceForSelectedGame(options: { cleanupExternalTabs?: boolean } = {}) {
+async function ensureWorkspaceForSelectedGame() {
   if (!appState.selectedGame) {
     return;
   }
@@ -2471,10 +2043,6 @@ async function ensureWorkspaceForSelectedGame(options: { cleanupExternalTabs?: b
     ...appState.selectedGame,
     categorySlug: resolvedSlug,
   };
-
-  if (options.cleanupExternalTabs && ENABLE_CONTENT_FALLBACK) {
-    await closeUtilityTabsOutsideWorkspace();
-  }
 }
 
 function pushGameToQueue(game: TwitchGame) {
@@ -2489,7 +2057,8 @@ async function advanceQueueIfCompleted(): Promise<boolean> {
     return false;
   }
 
-  const knownCompletedCurrent = appState.allDrops.length > 0 && appState.pendingDrops.length === 0 && appState.currentDrop === null;
+  const knownCompletedCurrent =
+    appState.allDrops.length > 0 && appState.pendingDrops.length === 0 && appState.currentDrop === null;
   if (!knownCompletedCurrent) {
     return true;
   }
@@ -2504,10 +2073,11 @@ async function advanceQueueIfCompleted(): Promise<boolean> {
     appState.completionNotified = false;
     invalidStreamChecks = 0;
 
-    await ensureWorkspaceForSelectedGame({ cleanupExternalTabs: true });
+    await ensureWorkspaceForSelectedGame();
     await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
 
-    const knownCompletedNext = appState.allDrops.length > 0 && appState.pendingDrops.length === 0 && appState.currentDrop === null;
+    const knownCompletedNext =
+      appState.allDrops.length > 0 && appState.pendingDrops.length === 0 && appState.currentDrop === null;
     if (knownCompletedNext) {
       removeGameFromQueue(nextGame);
       continue;
@@ -2546,19 +2116,14 @@ async function handleStartFarming(payload: { game?: TwitchGame }) {
   appState.isRunning = true;
   appState.isPaused = false;
   appState.completionNotified = false;
-  appState.workspaceWindowId = null;
-  appState.directoryTabId = null;
-  appState.dropsTabId = null;
-  appState.inventoryTabId = null;
   invalidStreamChecks = 0;
   lastStreamRotationAt = 0;
   streamValidationGraceUntil = 0;
-  lastInventoryRefreshAt = 0;
   dropClaimRetryAtById.clear();
   dropClaimInFlight = false;
   monitorTickInFlight = false;
 
-  await ensureWorkspaceForSelectedGame({ cleanupExternalTabs: true });
+  await ensureWorkspaceForSelectedGame();
   await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
   const advanced = await advanceQueueIfCompleted();
   if (!advanced) {
@@ -2642,7 +2207,6 @@ async function handleStopFarming() {
   invalidStreamChecks = 0;
   lastStreamRotationAt = 0;
   streamValidationGraceUntil = 0;
-  lastInventoryRefreshAt = 0;
   dropClaimRetryAtById.clear();
   dropClaimInFlight = false;
   monitorTickInFlight = false;
@@ -2665,7 +2229,7 @@ async function handleStopFarming() {
 
 async function handleSetSelectedGame(payload: { game: TwitchGame }) {
   const selectedGame = resolveGameFromState(payload.game);
-  logInfo('Selected game changed', {
+  logDebug('Selected game changed', {
     payloadGameId: payload.game.id,
     payloadCampaignId: payload.game.campaignId ?? null,
     payloadGameName: payload.game.name,
@@ -2682,15 +2246,26 @@ async function handleSetSelectedGame(payload: { game: TwitchGame }) {
     appState.queue = [selectedGame, ...appState.queue];
   }
   if (appState.isRunning && !appState.isPaused) {
-    await ensureWorkspaceForSelectedGame({ cleanupExternalTabs: true });
-    await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true, forceInventoryFetch: true });
+    await ensureWorkspaceForSelectedGame();
+    await refreshDropsData({
+      includeCampaignFetch: true,
+      includeInventoryFetch: true,
+      forceInventoryFetch: true,
+    });
   } else {
-    await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true, forceInventoryFetch: true });
+    await refreshDropsData({
+      includeCampaignFetch: true,
+      includeInventoryFetch: true,
+      forceInventoryFetch: true,
+    });
   }
   if (appState.selectedGame) {
     const canonicalSelected = resolveGameFromState(appState.selectedGame);
-    if (canonicalSelected.id !== appState.selectedGame.id || canonicalSelected.campaignId !== appState.selectedGame.campaignId) {
-      logInfo('Selected game canonicalized after refresh', {
+    if (
+      canonicalSelected.id !== appState.selectedGame.id ||
+      canonicalSelected.campaignId !== appState.selectedGame.campaignId
+    ) {
+      logDebug('Selected game canonicalized after refresh', {
         previousId: appState.selectedGame.id,
         previousCampaignId: appState.selectedGame.campaignId ?? null,
         nextId: canonicalSelected.id,
@@ -2797,19 +2372,19 @@ async function handleEnsureGamesCache(payload?: { force?: boolean }) {
 chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
   switch (message.type) {
     case 'ENSURE_GAMES_CACHE':
-      handleEnsureGamesCache(message.payload)
+      handleEnsureGamesCache(message.payload as { force?: boolean } | undefined)
         .then((result) => sendResponse(result))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
 
     case 'ADD_TO_QUEUE':
-      handleAddToQueue(message.payload)
+      handleAddToQueue(message.payload as { game?: TwitchGame })
         .then((result) => sendResponse(result))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
 
     case 'REMOVE_FROM_QUEUE':
-      handleRemoveFromQueue(message.payload)
+      handleRemoveFromQueue(message.payload as { game?: TwitchGame; gameId?: string; campaignId?: string })
         .then((result) => sendResponse(result))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
@@ -2821,13 +2396,13 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
       return true;
 
     case 'START_FARMING':
-      handleStartFarming(message.payload)
+      handleStartFarming(message.payload as { game?: TwitchGame })
         .then((result) => sendResponse(result))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
 
     case 'SET_SELECTED_GAME':
-      handleSetSelectedGame(message.payload)
+      handleSetSelectedGame(message.payload as { game: TwitchGame })
         .then((result) => sendResponse(result))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
@@ -2852,26 +2427,19 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
       return true;
 
     case 'UPDATE_GAMES':
-      appState.availableGames = mergeAvailableGames(appState.availableGames, message.payload ?? []);
+      appState.availableGames = mergeAvailableGames(
+        appState.availableGames,
+        (message.payload ?? []) as TwitchGame[],
+      );
       normalizeGameSelection(appState.availableGames);
       normalizeQueueSelection(appState.availableGames);
       saveState().then(() => sendResponse({ success: true }));
       return true;
 
-    case 'SYNC_DROPS_DATA':
-      if (message.payload) {
-        const previousCompletedIds = new Set(appState.completedDrops.map((drop) => drop.id));
-        updateStateFromSnapshot(message.payload as DropsSnapshot);
-        evaluateDropTransitions(previousCompletedIds)
-          .then(() => saveState())
-          .then(() => sendResponse({ success: true }));
-        return true;
-      }
-      sendResponse({ success: false });
-      return true;
-
     case 'SYNC_TWITCH_SESSION': {
-      const incoming = sanitizeTwitchSession((message.payload as { session?: unknown } | undefined)?.session ?? message.payload);
+      const incoming = sanitizeTwitchSession(
+        (message.payload as { session?: unknown } | undefined)?.session ?? message.payload,
+      );
       if (!incoming) {
         sendResponse({ success: false, error: 'Invalid session payload' });
         return true;
@@ -2879,7 +2447,7 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
       twitchSessionCache = incoming;
       persistTwitchSession(incoming)
         .then(() => {
-          logInfo('Twitch session synced from content script', sessionDebugSummary(incoming));
+          logDebug('Twitch session synced from content script', sessionDebugSummary(incoming));
           sendResponse({ success: true });
         })
         .catch((error) => sendResponse({ success: false, error: String(error) }));
@@ -2887,14 +2455,16 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
     }
 
     case 'SYNC_TWITCH_INTEGRITY': {
-      const payload = message.payload as { token?: string; expiration?: number; request_id?: string } | undefined;
+      const payload = message.payload as
+        | { token?: string; expiration?: number; request_id?: string }
+        | undefined;
       const token = typeof payload?.token === 'string' ? payload.token.trim() : '';
       if (!token) {
         sendResponse({ success: false, error: 'Empty integrity token' });
         return true;
       }
       const expiration = typeof payload?.expiration === 'number' ? payload.expiration : 0;
-      logInfo('Integrity token synced from content script', {
+      logDebug('Integrity token synced from content script', {
         tokenLength: token.length,
         expiration,
         hasSession: Boolean(twitchSessionCache),
@@ -2904,7 +2474,9 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
         persistTwitchSession(twitchSessionCache).catch(() => undefined);
       }
       // Also store the full integrity object separately for expiration tracking
-      chrome.storage.local.set({ twitchIntegrity: { token, expiration, request_id: payload?.request_id || '' } }).catch(() => undefined);
+      chrome.storage.local
+        .set({ twitchIntegrity: { token, expiration, request_id: payload?.request_id || '' } })
+        .catch(() => undefined);
       sendResponse({ success: true });
       return true;
     }
@@ -2932,43 +2504,18 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
 });
 
 chrome.tabs.onRemoved.addListener((removedTabId) => {
-  let dirty = false;
   if (appState.tabId === removedTabId) {
     appState.tabId = null;
     appState.activeStreamer = null;
-    dirty = true;
-  }
-  if (appState.directoryTabId === removedTabId) {
-    appState.directoryTabId = null;
-    dirty = true;
-  }
-  if (appState.dropsTabId === removedTabId) {
-    appState.dropsTabId = null;
-    dirty = true;
-  }
-  if (appState.inventoryTabId === removedTabId) {
-    appState.inventoryTabId = null;
-    dirty = true;
-  }
-  if (dirty) {
     saveState().catch(() => undefined);
   }
 });
 
 chrome.windows.onRemoved.addListener((removedWindowId) => {
-  let dirty = false;
   if (appState.monitorWindowId === removedWindowId) {
     appState.monitorWindowId = null;
-    dirty = true;
+    saveState().catch(() => undefined);
   }
-  if (appState.workspaceWindowId !== removedWindowId) {
-    if (dirty) {
-      saveState().catch(() => undefined);
-    }
-    return;
-  }
-  clearWorkspaceReferences();
-  saveState().catch(() => undefined);
 });
 
 console.log('DropHunter service worker loaded');

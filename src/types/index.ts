@@ -65,12 +65,8 @@ export interface AppState {
   allDrops: TwitchDrop[];
   availableGames: TwitchGame[];
   queue: TwitchGame[];
-  workspaceWindowId: number | null;
   monitorWindowId: number | null;
   tabId: number | null;
-  directoryTabId: number | null;
-  dropsTabId: number | null;
-  inventoryTabId: number | null;
   completionNotified: boolean;
 }
 
@@ -80,14 +76,8 @@ export interface StorageData {
 }
 
 export type MessageType =
-  | 'GET_DROPS_DATA'
-  | 'FETCH_DROPS_DATA'
   | 'GET_TWITCH_SESSION'
   | 'GET_STREAM_CONTEXT'
-  | 'GET_DIRECTORY_STREAMERS'
-  | 'GET_CATEGORY_SUGGESTIONS'
-  | 'FETCH_INVENTORY_DATA'
-  | 'EXPAND_GAME_ACCORDION'
   | 'PREPARE_STREAM_PLAYBACK'
   | 'OPEN_MONITOR_DASHBOARD'
   | 'ADD_TO_QUEUE'
@@ -99,11 +89,9 @@ export type MessageType =
   | 'RESUME_FARMING'
   | 'STOP_FARMING'
   | 'UPDATE_STATE'
-  | 'FETCH_GAMES'
   | 'ENSURE_GAMES_CACHE'
   | 'REFRESH_DROPS'
   | 'UPDATE_GAMES'
-  | 'SYNC_DROPS_DATA'
   | 'SYNC_TWITCH_SESSION'
   | 'SYNC_TWITCH_INTEGRITY'
   | 'PLAY_ALERT'
@@ -111,5 +99,5 @@ export type MessageType =
 
 export interface Message {
   type: MessageType;
-  payload?: any;
+  payload?: unknown;
 }

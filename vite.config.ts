@@ -1,7 +1,6 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import { resolve } from 'path'
-import { copyFileSync, mkdirSync } from 'fs'
+import react from '@vitejs/plugin-react';
+import { resolve } from 'path';
+import { defineConfig } from 'vite';
 
 export default defineConfig({
   plugins: [
@@ -26,22 +25,6 @@ export default defineConfig({
         }
       },
     },
-    {
-      name: 'copy-manifest-and-icons',
-      closeBundle() {
-        // Copia manifest.json
-        copyFileSync('public/manifest.json', 'dist/manifest.json')
-
-        // Copia cartella icons
-        mkdirSync('dist/icons', { recursive: true })
-        const icons = ['icon16.png', 'icon32.png', 'icon48.png', 'icon128.png']
-        icons.forEach(icon => {
-          copyFileSync(`public/icons/${icon}`, `dist/icons/${icon}`)
-        })
-
-        console.log('✓ Copied manifest.json and icons to dist/')
-      }
-    }
   ],
   base: './',
   build: {
@@ -61,10 +44,11 @@ export default defineConfig({
           return 'assets/[name]-[hash].js';
         },
         chunkFileNames: 'assets/[name]-[hash].js',
-        assetFileNames: 'assets/[name]-[hash].[ext]'
-      }
+        assetFileNames: 'assets/[name]-[hash].[ext]',
+      },
     },
+    target: 'chrome120',
     outDir: 'dist',
     emptyOutDir: true,
   },
-})
+});
