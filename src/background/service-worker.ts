@@ -553,7 +553,7 @@ async function loadState() {
       startMonitoring();
     }
   } catch (error) {
-    console.error('Error loading state:', error);
+    logWarn('Error loading state:', String(error));
   }
 }
 
@@ -1424,7 +1424,7 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
           }
           return retriedSnapshot;
         } catch (retryError) {
-          console.error('Twitch API snapshot fetch failed after integrity refresh:', retryError);
+          logWarn('Twitch API snapshot fetch failed after integrity refresh:', String(retryError));
         }
       }
 
@@ -1445,7 +1445,7 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
         }
         return fallbackSnapshot;
       } catch (fallbackError) {
-        console.error('Twitch API snapshot fetch failed without integrity fallback:', fallbackError);
+        logWarn('Twitch API snapshot fetch failed without integrity fallback:', String(fallbackError));
       }
     }
     if (isLikelyAuthError(error)) {
@@ -1454,7 +1454,7 @@ async function fetchDropsSnapshotFromApi(forceSessionRefresh = false): Promise<D
         return fetchDropsSnapshotFromApi(true);
       }
     }
-    console.error('Twitch API snapshot fetch failed:', error);
+    logWarn('Twitch API snapshot fetch failed:', String(error));
     return null;
   }
 }
@@ -1490,7 +1490,7 @@ async function fetchDirectoryStreamersFromApi(game: TwitchGame, forceSessionRefr
         return fetchDirectoryStreamersFromApi(game, true);
       }
     }
-    console.error('Twitch API directory fetch failed:', error);
+    logWarn('Twitch API directory fetch failed:', String(error));
     return [];
   }
 }
@@ -2187,10 +2187,10 @@ async function claimDropViaApi(drop: TwitchDrop): Promise<boolean> {
           return true;
         }
       } catch (secondError) {
-        console.error('Drop claim retry failed after refreshing Twitch session:', secondError);
+        logWarn('Drop claim retry failed after refreshing Twitch session:', String(secondError));
       }
     } else {
-      console.error('Drop claim failed:', error);
+      logWarn('Drop claim failed:', String(error));
     }
 
     dropClaimRetryAtById.set(claimId, Date.now() + DROP_CLAIM_RETRY_COOLDOWN_MS);
@@ -2363,9 +2363,9 @@ function startMonitoring() {
     clearInterval(monitoringInterval);
   }
   monitoringInterval = setInterval(() => {
-    checkDropProgress().catch((error) => console.error('Monitoring error:', error));
+    checkDropProgress().catch((error) => logWarn('Monitoring error:', String(error)));
   }, PROGRESS_POLL_MS);
-  checkDropProgress().catch((error) => console.error('Initial monitoring error:', error));
+  checkDropProgress().catch((error) => logWarn('Initial monitoring error:', String(error)));
 }
 
 function stopMonitoring() {
