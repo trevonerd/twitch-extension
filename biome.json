@@ -21,8 +21,8 @@
     "rules": {
       "recommended": true,
       "correctness": {
-        "noUnusedVariables": "off",
-        "useExhaustiveDependencies": "off"
+        "noUnusedVariables": "warn",
+        "useExhaustiveDependencies": "warn"
       },
       "style": {
         "noNonNullAssertion": "off",
@@ -35,7 +35,7 @@
       },
       "suspicious": {
         "noUnknownAtRules": "off",
-        "noExplicitAny": "off",
+        "noExplicitAny": "warn",
         "useIterableCallbackReturn": "off"
       }
     }
