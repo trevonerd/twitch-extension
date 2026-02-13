@@ -670,9 +670,11 @@ async function createManagedTab(url: string, active = false): Promise<chrome.tab
     if (currentActiveTab?.id) {
       const currentUrl = currentActiveTab.url ?? '';
       const canReuseCurrent =
-        !currentUrl.startsWith('chrome://') &&
-        !currentUrl.startsWith('chrome-extension://') &&
-        !currentUrl.startsWith('edge://');
+        !currentUrl ||
+        currentUrl === 'about:blank' ||
+        currentUrl.startsWith('chrome://newtab') ||
+        currentUrl.startsWith('edge://newtab') ||
+        /^https?:\/\/([^/]*\.)?twitch\.tv\//i.test(currentUrl);
       if (canReuseCurrent) {
         const updated = await chrome.tabs
           .update(currentActiveTab.id, { url, active: true })
@@ -700,12 +702,17 @@ async function ensureManagedTab(
   if (existingTabId) {
     const existingTab = await chrome.tabs.get(existingTabId).catch(() => null);
     if (existingTab?.id) {
-      if (existingTab.url !== targetUrl) {
-        await chrome.tabs.update(existingTab.id, { url: targetUrl, active }).catch(() => undefined);
-      } else if (active && !existingTab.active) {
-        await chrome.tabs.update(existingTab.id, { active: true }).catch(() => undefined);
+      const existingUrl = existingTab.url ?? '';
+      const isOnTwitch = /^https?:\/\/([^/]*\.)?twitch\.tv\//i.test(existingUrl);
+      if (isOnTwitch) {
+        if (existingTab.url !== targetUrl) {
+          await chrome.tabs.update(existingTab.id, { url: targetUrl, active }).catch(() => undefined);
+        } else if (active && !existingTab.active) {
+          await chrome.tabs.update(existingTab.id, { active: true }).catch(() => undefined);
+        }
+        return existingTab.id;
       }
-      return existingTab.id;
+      // Tab navigated away from Twitch — fall through to create new
     }
   }
 
@@ -2145,6 +2152,20 @@ async function handleStartFarming(payload: { game?: TwitchGame }) {
 
   await ensureWorkspaceForSelectedGame();
   await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
+
+  // Check if there are any farmable (non-event-based) drops before opening a stream tab
+  const hasFarmablePendingNow = appState.pendingDrops.some((d) => d.dropType !== 'event-based');
+  if (!hasFarmablePendingNow && appState.currentDrop === null) {
+    removeGameFromQueue(requestedGame);
+    appState.isRunning = false;
+    appState.isPaused = false;
+    appState.selectedGame = null;
+    stopMonitoring();
+    await saveState();
+    broadcastStateUpdate();
+    return { success: false, error: 'No farmable drops for this game.' };
+  }
+
   const advanced = await advanceQueueIfCompleted();
   if (!advanced) {
     return { success: false, error: 'Queue completed. No pending rewards left.' };
@@ -2578,8 +2599,11 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
   const isStillOnTwitch = /^https?:\/\/([^/]*\.)?twitch\.tv\//i.test(changeInfo.url);
   if (!isStillOnTwitch) {
     logInfo('Managed tab navigated away from Twitch (onUpdated)', { url: changeInfo.url });
-    // Force rotation on next tick by maxing the invalid counter
+    // Release the tab so next rotation creates a NEW tab instead of hijacking this one
+    appState.tabId = null;
+    appState.activeStreamer = null;
     invalidStreamChecks = INVALID_STREAM_THRESHOLD;
+    saveState().catch(() => undefined);
   }
 });
 
