@@ -536,6 +536,10 @@ function parseCampaignDrops(
     const imageUrl = normalizeImageUrl(getFirstImageUrl(drop)) || game.imageUrl;
     const endsAt = inventoryState?.endsAt ?? toIsoDate(drop.endAt) ?? campaignEndsAt;
 
+    // Drops with no watch-time requirement are not farmable (e.g. sub-only rewards
+    // that the Twitch API places in timeBasedDrops instead of eventBasedDrops)
+    const isFarmable = requiredMinutes !== null && requiredMinutes > 0;
+
     return {
       id: dropId,
       claimId: claimId || undefined,
@@ -554,6 +558,7 @@ function parseCampaignDrops(
       requiredMinutes,
       remainingMinutes,
       progressSource: 'campaign',
+      ...(!isFarmable && { dropType: 'event-based' as const }),
     } satisfies TwitchDrop;
   });
 
@@ -799,10 +804,14 @@ export class TwitchApiClient {
       const eventDrops = parseEventBasedDrops(mergedCampaign, game, claimedRewards, globalClaimedIdCounts);
 
       const allCampaignDrops = [...campaignDrops, ...eventDrops];
-      games.push({
-        ...game,
-        dropCount: allCampaignDrops.length,
-      });
+      // Only include game if campaign has at least one farmable drop
+      const hasFarmableDrops = campaignDrops.some((d) => d.dropType !== 'event-based');
+      if (hasFarmableDrops) {
+        games.push({
+          ...game,
+          dropCount: allCampaignDrops.length,
+        });
+      }
       drops.push(...allCampaignDrops);
     });
 
