@@ -362,7 +362,13 @@ function App() {
     withAction(async () => {
       const gameToStart = state.selectedGame ?? queueGames[0];
       if (!gameToStart) return;
-      await chrome.runtime.sendMessage({ type: 'START_FARMING', payload: { game: gameToStart } });
+      const response = (await chrome.runtime.sendMessage({
+        type: 'START_FARMING',
+        payload: { game: gameToStart },
+      })) as { success?: boolean; error?: string } | undefined;
+      if (response && !response.success && response.error) {
+        setQueueMessage(response.error);
+      }
     });
 
   const handlePause = () =>
