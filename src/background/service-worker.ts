@@ -367,6 +367,12 @@ function dropStateKey(drop: TwitchDrop): string {
   return `${drop.id}::${drop.campaignId ?? ''}::${normalizeToken(drop.gameName)}::${normalizeToken(drop.name)}::${normalizeToken(drop.imageUrl)}`;
 }
 
+function isDropCampaignExpired(drop: TwitchDrop): boolean {
+  if (!drop.endsAt) return false;
+  const endsAtMs = new Date(drop.endsAt).getTime();
+  return Number.isFinite(endsAtMs) && endsAtMs <= Date.now();
+}
+
 function dropMatchesSelectedGame(drop: TwitchDrop, selected: TwitchGame): boolean {
   const selectedName = normalizeToken(selected.name);
   const selectedCategory = normalizeToken(selected.categorySlug ?? toSlug(selected.name));
@@ -487,7 +493,9 @@ function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
     .filter((drop) => drop.claimed)
     .forEach((drop) => mergedRelevant.push(drop));
 
-  const relevantForState = mergedRelevant;
+  const relevantForState = mergedRelevant.filter(
+    (drop) => isDropCompleted(drop) || !isDropCampaignExpired(drop),
+  );
 
   const completed = relevantForState
     .filter((drop) => isDropCompleted(drop))
@@ -525,6 +533,16 @@ function splitDropsForSelectedGame(allDrops: TwitchDrop[]) {
   });
 }
 
+function annotateGameCompletion(games: TwitchGame[], drops: TwitchDrop[]): TwitchGame[] {
+  return games.map((game) => {
+    const matching = drops.filter((drop) => dropMatchesSelectedGame(drop, game));
+    const allCompleted = matching.length > 0 && matching.every((d) => isDropCompleted(d));
+    return allCompleted !== (game.allDropsCompleted ?? false)
+      ? { ...game, allDropsCompleted: allCompleted }
+      : game;
+  });
+}
+
 function updateStateFromSnapshot(snapshot: DropsSnapshot) {
   if (Array.isArray(snapshot.drops) && snapshot.drops.length > 0) {
     cachedDropsSnapshot = snapshot.drops;
@@ -537,9 +555,10 @@ function updateStateFromSnapshot(snapshot: DropsSnapshot) {
     snapshot.games.length > 0
       ? dedupeAvailableGames(snapshot.games.filter((g) => !isExpiredGame(g)))
       : appState.availableGames;
-  appState.availableGames = orderedGames;
-  normalizeGameSelection(orderedGames);
-  normalizeQueueSelection(orderedGames);
+  const annotatedGames = annotateGameCompletion(orderedGames, snapshot.drops);
+  appState.availableGames = annotatedGames;
+  normalizeGameSelection(annotatedGames);
+  normalizeQueueSelection(annotatedGames);
   splitDropsForSelectedGame(snapshot.drops);
 }
 
@@ -1823,6 +1842,7 @@ interface RefreshDropsOptions {
   includeCampaignFetch?: boolean;
   includeInventoryFetch?: boolean;
   forceInventoryFetch?: boolean;
+  suppressNotifications?: boolean;
 }
 
 async function refreshDropsData(options: RefreshDropsOptions = {}) {
@@ -1904,7 +1924,9 @@ async function refreshDropsData(options: RefreshDropsOptions = {}) {
     drops: drops.length,
     selectedGame: appState.selectedGame?.name ?? null,
   });
-  await evaluateDropTransitions(previousCompletedIds);
+  if (!options.suppressNotifications) {
+    await evaluateDropTransitions(previousCompletedIds);
+  }
   await saveState();
 }
 
@@ -2098,7 +2120,11 @@ async function advanceQueueIfCompleted(): Promise<boolean> {
     lastProgressAdvanceAt = 0;
 
     await ensureWorkspaceForSelectedGame();
-    await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
+    await refreshDropsData({
+      includeCampaignFetch: true,
+      includeInventoryFetch: true,
+      suppressNotifications: true,
+    });
 
     const hasFarmablePendingNext = appState.pendingDrops.some((d) => d.dropType !== 'event-based');
     const knownCompletedNext =
@@ -2151,7 +2177,11 @@ async function handleStartFarming(payload: { game?: TwitchGame }) {
   monitorTickInFlight = false;
 
   await ensureWorkspaceForSelectedGame();
-  await refreshDropsData({ includeCampaignFetch: true, includeInventoryFetch: true });
+  await refreshDropsData({
+    includeCampaignFetch: true,
+    includeInventoryFetch: true,
+    suppressNotifications: true,
+  });
 
   // Check if there are any farmable (non-event-based) drops before opening a stream tab
   const hasFarmablePendingNow = appState.pendingDrops.some((d) => d.dropType !== 'event-based');
@@ -2331,12 +2361,14 @@ async function handleSetSelectedGame(payload: { game: TwitchGame }) {
       includeCampaignFetch: true,
       includeInventoryFetch: true,
       forceInventoryFetch: true,
+      suppressNotifications: true,
     });
   } else {
     await refreshDropsData({
       includeCampaignFetch: true,
       includeInventoryFetch: true,
       forceInventoryFetch: true,
+      suppressNotifications: true,
     });
   }
   if (appState.selectedGame) {

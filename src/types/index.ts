@@ -9,6 +9,7 @@ export interface TwitchGame {
   expiryStatus?: ExpiryStatus;
   dropCount?: number;
   isConnected?: boolean;
+  allDropsCompleted?: boolean;
   allowedChannels?: string[] | null; // null = any channel, string[] = restricted to these logins
 }
 

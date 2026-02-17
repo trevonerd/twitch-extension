@@ -526,7 +526,7 @@ function App() {
             <option value="">Select a campaign...</option>
             {sortedGames.map((game) => (
               <option key={game.id} value={game.id}>
-                {game.isConnected === false ? '\u{1F512} ' : ''}
+                {game.allDropsCompleted ? '\u2705 ' : game.isConnected === false ? '\u{1F512} ' : ''}
                 {game.name} · {expiryLabel(game.expiryStatus)}
               </option>
             ))}
@@ -553,6 +553,7 @@ function App() {
                 key={`${game.id}-${i}`}
                 className="inline-flex items-center gap-0.5 rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-gray-200"
               >
+                {game.allDropsCompleted ? '\u2705 ' : ''}
                 {game.name}
                 {!state.isRunning && (
                   <button
