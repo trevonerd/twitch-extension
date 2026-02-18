@@ -338,10 +338,10 @@ function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
   return lookup;
 }
 
-/** Global (cross-game) benefit ID counts — fallback when game name doesn't match between campaign and inventory */
-function buildGlobalClaimedIdCounts(inventoryRaw: unknown): Map<string, number> {
-  const counts = new Map<string, number>();
-  if (!inventoryRaw || typeof inventoryRaw !== 'object') return counts;
+/** Global (cross-game) benefit ID set — fallback when game name doesn't match between campaign and inventory */
+function buildGlobalClaimedIdCounts(inventoryRaw: unknown): Set<string> {
+  const ids = new Set<string>();
+  if (!inventoryRaw || typeof inventoryRaw !== 'object') return ids;
   const inventory = inventoryRaw as Record<string, unknown>;
   const gameEventDrops = Array.isArray(inventory.gameEventDrops)
     ? (inventory.gameEventDrops as Array<Record<string, unknown>>)
@@ -349,9 +349,9 @@ function buildGlobalClaimedIdCounts(inventoryRaw: unknown): Map<string, number> 
   gameEventDrops.forEach((drop) => {
     if (!drop || typeof drop !== 'object') return;
     const benefitId = normalizeText(drop.id);
-    if (benefitId) counts.set(benefitId, (counts.get(benefitId) ?? 0) + 1);
+    if (benefitId) ids.add(benefitId);
   });
-  return counts;
+  return ids;
 }
 
 function isCampaignConnected(campaign: Record<string, unknown>): boolean {
@@ -427,12 +427,12 @@ function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | 
   };
 }
 
-/** 3-layer claimed detection with consumption: ID match → name match → global ID fallback */
+/** 3-layer claimed detection: ID match → name match → global ID fallback */
 function matchClaimedReward(
   benefitIds: string[],
   benefitNames: string[],
   gameClaimedRewards: ClaimedRewardEntry | undefined,
-  globalClaimedIdCounts: Map<string, number>,
+  globalClaimedIdCounts: Set<string>,
 ): { idMatch: boolean; nameMatch: boolean; globalIdMatch: boolean } {
   let idMatch = false;
   if (gameClaimedRewards != null) {
@@ -459,10 +459,8 @@ function matchClaimedReward(
   let globalIdMatch = false;
   if (!idMatch && !nameMatch && gameClaimedRewards == null) {
     for (const id of benefitIds) {
-      const remaining = globalClaimedIdCounts.get(id) ?? 0;
-      if (remaining > 0) {
+      if (globalClaimedIdCounts.has(id)) {
         globalIdMatch = true;
-        globalClaimedIdCounts.set(id, remaining - 1);
         break;
       }
     }
@@ -475,7 +473,7 @@ function parseCampaignDrops(
   game: TwitchGame,
   inventoryMaps: InventoryDropMaps,
   claimedRewards: ClaimedRewardLookup,
-  globalClaimedIdCounts: Map<string, number>,
+  globalClaimedIdCounts: Set<string>,
 ): TwitchDrop[] {
   const campaignId = normalizeText(campaign.id) || game.campaignId || '';
   const campaignEndsAt = toIsoDate(campaign.endAt);
@@ -569,7 +567,7 @@ function parseEventBasedDrops(
   campaign: Record<string, unknown>,
   game: TwitchGame,
   claimedRewards: ClaimedRewardLookup,
-  globalClaimedIdCounts: Map<string, number>,
+  globalClaimedIdCounts: Set<string>,
 ): TwitchDrop[] {
   const campaignId = normalizeText(campaign.id) || game.campaignId || '';
   const campaignEndsAt = toIsoDate(campaign.endAt);
