@@ -85,3 +85,14 @@ test('pickNearestDrop returns null when only event-based drops exist', () => {
 
   expect(pickNearestDrop(drops)).toBe(null);
 });
+
+test('sortPendingDrops sorts null remainingMinutes after finite ETA', () => {
+  const drops = [
+    createDrop({ name: 'NullETA', remainingMinutes: null, expiresInMs: 100_000 }),
+    createDrop({ name: 'FiniteETA', remainingMinutes: 30, expiresInMs: 100_000 }),
+  ];
+
+  const ordered = sortPendingDrops(drops);
+  expect(ordered[0].name).toBe('FiniteETA');
+  expect(ordered[1].name).toBe('NullETA');
+});
