@@ -153,3 +153,18 @@ test('isDropCompleted returns false when progress 100 but claimable', () => {
 test('isDropCompleted returns false when progress < 100', () => {
   expect(isDropCompleted(createDrop({ progress: 50 }))).toBe(false);
 });
+
+test('merge claimable=true in prev but claimed=true in next → merged is claimed=true, claimable=false', () => {
+  const next = createDrop({ claimed: true, claimable: false });
+  const prev = createDrop({ claimed: false, claimable: true });
+  const merged = mergeDropProgressMonotonic(next, prev);
+  expect(merged.claimed).toBe(true);
+  expect(merged.claimable).toBe(false);
+});
+
+test('merge both drops have requiredMinutes: null → merged requiredMinutes stays null', () => {
+  const next = createDrop({ requiredMinutes: null });
+  const prev = createDrop({ requiredMinutes: null });
+  const merged = mergeDropProgressMonotonic(next, prev);
+  expect(merged.requiredMinutes).toBeNull();
+});

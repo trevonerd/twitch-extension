@@ -57,11 +57,11 @@ const CLAIM_DROP_REWARD_QUERY = {
   },
 };
 
-function normalizeText(value: unknown): string {
+export function normalizeText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function toNumber(value: unknown): number | null {
+export function toNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
@@ -74,7 +74,7 @@ function toNumber(value: unknown): number | null {
   return null;
 }
 
-function toIsoDate(value: unknown): string | null {
+export function toIsoDate(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) {
     return null;
   }
@@ -86,7 +86,7 @@ function withBoxArtSize(url: string): string {
   return url.replace(/\{width\}/gi, '285').replace(/\{height\}/gi, '380');
 }
 
-function normalizeImageUrl(value: unknown): string {
+export function normalizeImageUrl(value: unknown): string {
   const raw = normalizeText(value);
   if (!raw) {
     return '';
@@ -147,7 +147,7 @@ function getFirstImageUrl(value: unknown, depth = 0): string {
   return '';
 }
 
-function computeExpiry(endsAt: string | null): {
+export function computeExpiry(endsAt: string | null): {
   expiresInMs: number | null;
   expiryStatus: TwitchGame['expiryStatus'];
 } {
@@ -256,38 +256,35 @@ function buildInventoryDropMaps(inventoryRaw: unknown): InventoryDropMaps {
   return { byCampaignDrop, byDropId };
 }
 
-function extractBenefitNames(drop: Record<string, unknown>): string[] {
+function extractBenefitProperty(drop: Record<string, unknown>, key: 'name' | 'id'): string[] {
   const edges = Array.isArray(drop.benefitEdges) ? (drop.benefitEdges as Array<unknown>) : [];
   return edges
     .map((edge) => {
       if (!edge || typeof edge !== 'object') return '';
       const benefit = (edge as Record<string, unknown>).benefit;
       if (!benefit || typeof benefit !== 'object') return '';
-      return normalizeText((benefit as Record<string, unknown>).name).toLowerCase();
+      const val = normalizeText((benefit as Record<string, unknown>)[key]);
+      return key === 'name' ? val.toLowerCase() : val;
     })
-    .filter((name) => name.length > 0);
+    .filter((v) => v.length > 0);
 }
 
-function extractBenefitIds(drop: Record<string, unknown>): string[] {
-  const edges = Array.isArray(drop.benefitEdges) ? (drop.benefitEdges as Array<unknown>) : [];
-  return edges
-    .map((edge) => {
-      if (!edge || typeof edge !== 'object') return '';
-      const benefit = (edge as Record<string, unknown>).benefit;
-      if (!benefit || typeof benefit !== 'object') return '';
-      return normalizeText((benefit as Record<string, unknown>).id);
-    })
-    .filter((id) => id.length > 0);
+export function extractBenefitNames(drop: Record<string, unknown>): string[] {
+  return extractBenefitProperty(drop, 'name');
+}
+
+export function extractBenefitIds(drop: Record<string, unknown>): string[] {
+  return extractBenefitProperty(drop, 'id');
 }
 
 /** Lookup of claimed rewards from inventory gameEventDrops, keyed by normalized game name */
-interface ClaimedRewardEntry {
+export interface ClaimedRewardEntry {
   nameCounts: Map<string, number>;
   idCounts: Map<string, number>;
 }
-type ClaimedRewardLookup = Map<string, ClaimedRewardEntry>;
+export type ClaimedRewardLookup = Map<string, ClaimedRewardEntry>;
 
-function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
+export function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
   const lookup: ClaimedRewardLookup = new Map();
 
   if (!inventoryRaw || typeof inventoryRaw !== 'object') {
@@ -339,7 +336,7 @@ function buildClaimedRewardLookup(inventoryRaw: unknown): ClaimedRewardLookup {
 }
 
 /** Global (cross-game) benefit ID set — fallback when game name doesn't match between campaign and inventory */
-function buildGlobalClaimedIdCounts(inventoryRaw: unknown): Set<string> {
+export function buildGlobalClaimedIdCounts(inventoryRaw: unknown): Set<string> {
   const ids = new Set<string>();
   if (!inventoryRaw || typeof inventoryRaw !== 'object') return ids;
   const inventory = inventoryRaw as Record<string, unknown>;
@@ -428,7 +425,7 @@ function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | 
 }
 
 /** 3-layer claimed detection: ID match → name match → global ID fallback */
-function matchClaimedReward(
+export function matchClaimedReward(
   benefitIds: string[],
   benefitNames: string[],
   gameClaimedRewards: ClaimedRewardEntry | undefined,
