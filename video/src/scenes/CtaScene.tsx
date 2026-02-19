@@ -191,7 +191,7 @@ export const CtaScene: React.FC = () => {
               textTransform: "uppercase",
             }}
           >
-            v1.6.1 &middot; Chrome &amp; Brave
+            v1.6.2 &middot; Chrome &amp; Brave
           </span>
         </div>
       </div>

@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from 'node:fs';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'path';
 import { defineConfig } from 'vite';
@@ -5,6 +6,18 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   plugins: [
     react(),
+    {
+      // Single source of truth: read version from package.json and write it
+      // into dist/manifest.json so only package.json needs bumping on release.
+      name: 'sync-manifest-version',
+      closeBundle() {
+        const { version } = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8'));
+        const manifestPath = resolve(__dirname, 'dist/manifest.json');
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+        manifest.version = version;
+        writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      },
+    },
     {
       // Wrap content scripts in IIFE with duplicate-injection guard.
       // Chrome may re-inject content scripts during SPA navigation or

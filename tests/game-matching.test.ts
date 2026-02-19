@@ -61,6 +61,11 @@ test('tokenOverlapScore returns 0 when one side has no qualifying tokens', () =>
   expect(tokenOverlapScore('AB', 'CD')).toBe(0);
 });
 
+test('tokenOverlapScore returns 0 when all tokens are shorter than 3 chars', () => {
+  // "go", "to", "be" are all < 3 chars, no qualifying tokens on either side
+  expect(tokenOverlapScore('go to', 'be do')).toBe(0);
+});
+
 test('tokenOverlapScore handles partial overlap', () => {
   // "call", "duty", "modern", "warfare" vs "call", "duty", "black", "ops"
   // overlap: "call", "duty" = 2, max size = 4
