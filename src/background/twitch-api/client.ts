@@ -365,7 +365,7 @@ function isCampaignUsable(campaign: Record<string, unknown>): boolean {
   if (!status) {
     return true;
   }
-  return status !== 'EXPIRED' && status !== 'INVALID';
+  return status !== 'EXPIRED' && status !== 'INVALID' && status !== 'CLOSED';
 }
 
 function parseGameFromCampaign(campaign: Record<string, unknown>): TwitchGame | null {

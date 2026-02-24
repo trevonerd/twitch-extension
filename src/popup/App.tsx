@@ -233,6 +233,11 @@ function App() {
   const [state, setState] = useState<AppState>(createInitialState());
   const [loading, setLoading] = useState(true);
   const [gamesLoading, setGamesLoading] = useState(true);
+  const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
+  const isStale =
+    !state.isRunning &&
+    !gamesLoading &&
+    Date.now() - (state.lastSuccessfulRefreshAt ?? 0) > STALE_THRESHOLD_MS;
   const [rewardsLoading, setRewardsLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [queueMessage, setQueueMessage] = useState<string | null>(null);
@@ -650,6 +655,26 @@ function App() {
             <span className="font-semibold text-green-400">Completed ({completedDrops.length})</span>{' '}
             {completedDrops.map((d) => `\u2713 ${d.name}`).join('  ')}
           </p>
+        )}
+
+        {/* Stale data — refresh prompt */}
+        {isStale && state.availableGames.length > 0 && (
+          <div className="glass rounded-lg p-3 border border-yellow-500/30">
+            <div className="space-y-2">
+              <p className="text-xs text-yellow-300 font-semibold">Campaign data may be outdated</p>
+              <p className="text-xs text-gray-400">
+                Open the Twitch Drops page so the extension can fetch the latest campaigns.
+              </p>
+              <button
+                type="button"
+                onClick={openDropsPage}
+                className="flex items-center gap-1.5 rounded-lg bg-twitch-purple/80 hover:bg-twitch-purple px-3 py-1.5 text-xs font-semibold text-white transition-colors"
+              >
+                <DropsIcon size={14} />
+                Open Twitch Drops Page
+              </button>
+            </div>
+          </div>
         )}
 
         {/* No campaigns — first-launch guidance */}

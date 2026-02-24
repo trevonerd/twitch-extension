@@ -71,6 +71,7 @@ export interface AppState {
   monitorWindowId: number | null;
   tabId: number | null;
   completionNotified: boolean;
+  lastSuccessfulRefreshAt?: number;
 }
 
 export interface StorageData {

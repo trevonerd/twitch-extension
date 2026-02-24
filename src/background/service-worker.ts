@@ -1427,6 +1427,7 @@ async function refreshGamesCacheFromHiddenFetch(): Promise<TwitchGame[]> {
     const apiSnapshot = await fetchDropsSnapshotFromApi();
     if (apiSnapshot?.games?.length) {
       fetchedGames = apiSnapshot.games;
+      appState.lastSuccessfulRefreshAt = Date.now();
       if (apiSnapshot.drops.length > 0) {
         cachedDropsSnapshot = apiSnapshot.drops;
       }
@@ -2416,23 +2417,26 @@ async function handleAddToQueue(payload: { game?: TwitchGame }) {
     return { success: true, added: false, reason: 'already-queued', game: targetGame };
   }
 
-  const inspection = await inspectGameProgress(targetGame);
-  if (inspection.allDrops.length > 0 && !inspection.hasFarmableDrops) {
+  // Use cached drops — no API call needed; monitoring keeps this fresh every 15 s.
+  // If cache is empty (fresh install), allDrops = [] so the completed-check is skipped
+  // and the game is added to the queue; farming will validate on start.
+  const { allDrops, hasFarmableDrops } = evaluateDropsForGame(targetGame, cachedDropsSnapshot);
+  if (allDrops.length > 0 && !hasFarmableDrops) {
     await saveState();
     return {
       success: true,
       added: false,
       reason: 'already-completed',
-      game: inspection.resolvedGame,
+      game: targetGame,
     };
   }
 
-  pushGameToQueue(inspection.resolvedGame);
+  pushGameToQueue(targetGame);
   await saveState();
   return {
     success: true,
     added: true,
-    game: inspection.resolvedGame,
+    game: targetGame,
     queueLength: appState.queue.length,
   };
 }
@@ -2543,6 +2547,9 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
         appState.availableGames,
         (message.payload ?? []) as TwitchGame[],
       );
+      if (appState.availableGames.length > 0) {
+        appState.lastSuccessfulRefreshAt = Date.now();
+      }
       normalizeGameSelection(appState.availableGames);
       normalizeQueueSelection(appState.availableGames);
       saveState().then(() => sendResponse({ success: true }));
